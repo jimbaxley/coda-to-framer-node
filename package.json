@@ -1,0 +1,14 @@
+{
+  "name": "coda-to-framer-node",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "framer-api": "^0.1.1",
+    "marked": "^12.0.2",
+    "sanitize-html": "^2.13.0"
+  }
+}
