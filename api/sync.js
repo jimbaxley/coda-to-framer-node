@@ -192,7 +192,9 @@ export default async function handler(req, res) {
       warnings: mappingResult.warnings,
       published: publishResult?.published ?? false,
       deploymentId: publishResult?.deploymentId ?? "",
-      message: `Successfully synced ${mappingResult.items.length} items to collection \"${collection.collectionName}\"${collection.created ? " (created)" : ""}${mappingResult.skippedCount > 0 ? `. Skipped ${mappingResult.skippedCount} rows.` : ""}${publishResult?.published ? ` Published with deployment ${publishResult.deploymentId}` : "."}`,
+      message: publishResult?.published 
+        ? `✅ Synced ${mappingResult.items.length} items to "${collection.collectionName}" and published (deployment: ${publishResult.deploymentId}).`
+        : `✅ Synced ${mappingResult.items.length} items to "${collection.collectionName}".`,
     };
     console.log(`[sync] Final response:`, responseBody);
     return sendJson(res, 200, responseBody);
