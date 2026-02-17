@@ -1,4 +1,4 @@
-import { getCodaTableData } from "../lib/coda-client.js";
+import { getCodaTableData, resolveColumnNameOrId } from "../lib/coda-client.js";
 import {
   normalizeColumns,
   normalizeRows,
@@ -116,10 +116,23 @@ export default async function handler(req, res) {
       payload.rowLimit || 100,
     );
 
+    // Resolve responseColumnId if provided
+    let responseColumnId = null;
+    if (payload.responseColumnId) {
+      responseColumnId = await resolveColumnNameOrId(
+        payload.docId,
+        payload.tableIdOrName,
+        payload.responseColumnId,
+        codaApiToken,
+      );
+      console.log(`[sync] Resolved response column: "${payload.responseColumnId}" -> ${responseColumnId}`);
+    }
+
     console.log(`[sync] Coda data:`, {
       columnsCount: tableData.columns.length,
       rowsCount: tableData.rows.length,
       slugFieldId: payload.slugFieldId,
+      responseColumnId,
       columnIds: tableData.columns.map(c => c.id),
       firstRowValues: tableData.rows[0]?.values,
     });
@@ -192,6 +205,7 @@ export default async function handler(req, res) {
       warnings: mappingResult.warnings,
       published: publishResult?.published ?? false,
       deploymentId: publishResult?.deploymentId ?? "",
+      responseColumnId,
       message: publishResult?.published 
         ? `✅ Synced ${mappingResult.items.length} items to "${collection.collectionName}" and published (deployment: ${publishResult.deploymentId}).`
         : `✅ Synced ${mappingResult.items.length} items to "${collection.collectionName}".`,
