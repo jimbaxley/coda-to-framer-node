@@ -8,6 +8,7 @@ import {
   getOrCreateManagedCollection,
   setCollectionFields,
   addItemsToCollection,
+  publishProject,
 } from "../lib/framer-client.js";
 
 function sendJson(res, status, body) {
@@ -40,6 +41,34 @@ export default async function handler(req, res) {
   try {
     const payload = await readJsonBody(req);
 
+    // Handle publish action
+    if (payload.action === "publish") {
+      if (!payload.framerProjectUrl) {
+        return sendJson(res, 400, {
+          error: "INVALID_REQUEST",
+          message: "Missing required field: framerProjectUrl",
+        });
+      }
+
+      const framerApiKey = process.env.FRAMER_API_KEY || payload.framerApiKey;
+      if (!framerApiKey) {
+        return sendJson(res, 400, {
+          error: "INVALID_REQUEST",
+          message: "Missing Framer API key",
+        });
+      }
+
+      console.log(`[publish] Publishing project: ${payload.framerProjectUrl}`);
+      const publishResult = await publishProject(
+        payload.framerProjectUrl,
+        framerApiKey,
+      );
+      console.log(`[publish] Result:`, publishResult);
+
+      return sendJson(res, 200, publishResult);
+    }
+
+    // Handle sync action (default)
     const required = [
       "docId",
       "tableIdOrName",
@@ -135,13 +164,26 @@ export default async function handler(req, res) {
       console.log(`[sync] No items to add`);
     }
 
+    let publishResult = null;
+    if (payload.publish) {
+      console.log(`[sync] Publishing project after sync...`);
+      publishResult = await publishProject(
+        payload.framerProjectUrl,
+        framerApiKey,
+      );
+      console.log(`[sync] Publish result:`, publishResult);
+    }
+
     return sendJson(res, 200, {
+      success: true,
       collectionId: collection.collectionId,
       collectionName: collection.collectionName,
       itemsAdded: mappingResult.items.length,
       fieldsSet,
       warnings: mappingResult.warnings,
-      message: `Successfully synced ${mappingResult.items.length} items to collection \"${collection.collectionName}\"${collection.created ? " (created)" : ""}${mappingResult.skippedCount > 0 ? `. Skipped ${mappingResult.skippedCount} rows.` : "."}`,
+      published: publishResult?.published ?? false,
+      deploymentId: publishResult?.deploymentId ?? "",
+      message: `Successfully synced ${mappingResult.items.length} items to collection \"${collection.collectionName}\"${collection.created ? " (created)" : ""}${mappingResult.skippedCount > 0 ? `. Skipped ${mappingResult.skippedCount} rows.` : ""}${publishResult?.published ? ` Published with deployment ${publishResult.deploymentId}` : "."}`,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
