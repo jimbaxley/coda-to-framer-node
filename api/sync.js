@@ -40,6 +40,13 @@ export default async function handler(req, res) {
 
   try {
     const payload = await readJsonBody(req);
+    console.log(`[sync] Request payload:`, { 
+      docId: payload.docId, 
+      tableIdOrName: payload.tableIdOrName,
+      collectionName: payload.collectionName,
+      publish: payload.publish,
+      action: payload.action,
+    });
 
     // Handle publish action
     if (payload.action === "publish") {
@@ -172,9 +179,11 @@ export default async function handler(req, res) {
         framerApiKey,
       );
       console.log(`[sync] Publish result:`, publishResult);
+    } else {
+      console.log(`[sync] Publish parameter not set (payload.publish=${payload.publish})`);
     }
 
-    return sendJson(res, 200, {
+    const responseBody = {
       success: true,
       collectionId: collection.collectionId,
       collectionName: collection.collectionName,
@@ -184,7 +193,9 @@ export default async function handler(req, res) {
       published: publishResult?.published ?? false,
       deploymentId: publishResult?.deploymentId ?? "",
       message: `Successfully synced ${mappingResult.items.length} items to collection \"${collection.collectionName}\"${collection.created ? " (created)" : ""}${mappingResult.skippedCount > 0 ? `. Skipped ${mappingResult.skippedCount} rows.` : ""}${publishResult?.published ? ` Published with deployment ${publishResult.deploymentId}` : "."}`,
-    });
+    };
+    console.log(`[sync] Final response:`, responseBody);
+    return sendJson(res, 200, responseBody);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[sync] Error:`, message, error);
