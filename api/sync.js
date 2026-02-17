@@ -1,4 +1,4 @@
-import { getCodaTableData, resolveColumnNameOrId } from "../lib/coda-client.js";
+import { getCodaTableData, resolveColumnNameOrId, updateTableCell } from "../lib/coda-client.js";
 import {
   normalizeColumns,
   normalizeRows,
@@ -130,7 +130,7 @@ export default async function handler(req, res) {
 
     // Resolve slugFieldId (accepts both column name and ID)
     let resolvedSlugFieldId = payload.slugFieldId;
-    try {
+    if (payload.slugFieldId) {
       resolvedSlugFieldId = await resolveColumnNameOrId(
         payload.docId,
         payload.tableIdOrName,
@@ -140,10 +140,6 @@ export default async function handler(req, res) {
       if (resolvedSlugFieldId !== payload.slugFieldId) {
         console.log(`[sync] Resolved slug field: "${payload.slugFieldId}" -> ${resolvedSlugFieldId}`);
       }
-    } catch (error) {
-      console.error(`[sync] Failed to resolve slug field: ${error.message}`);
-      // If resolution fails, use the original value (it might already be an ID)
-      resolvedSlugFieldId = payload.slugFieldId;
     }
 
     console.log(`[sync] Coda data:`, {
@@ -152,6 +148,7 @@ export default async function handler(req, res) {
       slugFieldId: resolvedSlugFieldId,
       responseColumnId,
       columnIds: tableData.columns.map(c => c.id),
+      columnNames: tableData.columns.map(c => c.name),
       firstRowValues: tableData.rows[0]?.values,
     });
 
@@ -229,6 +226,29 @@ export default async function handler(req, res) {
         : `✅ Synced ${mappingResult.items.length} items to "${collection.collectionName}".`,
     };
     console.log(`[sync] Final response:`, responseBody);
+
+    // Update the response column in the specified row if both rowId and responseColumnId are provided
+    if (payload.rowId && responseColumnId) {
+      try {
+        console.log(`[sync] Updating row ${payload.rowId}, column ${responseColumnId} with response...`);
+        await updateTableCell(
+          payload.docId,
+          payload.tableIdOrName,
+          payload.rowId,
+          responseColumnId,
+          JSON.stringify(responseBody),
+          codaApiToken,
+        );
+        console.log(`[sync] Cell updated successfully`);
+      } catch (updateError) {
+        const updateErrorMsg = updateError instanceof Error ? updateError.message : String(updateError);
+        console.error(`[sync] Failed to update response cell: ${updateErrorMsg}`);
+        // Don't fail the sync if cell update fails - just log the error
+        responseBody.warnings = responseBody.warnings || [];
+        responseBody.warnings.push(`Warning: Could not write response to column: ${updateErrorMsg}`);
+      }
+    }
+
     return sendJson(res, 200, responseBody);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
