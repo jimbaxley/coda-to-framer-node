@@ -128,10 +128,28 @@ export default async function handler(req, res) {
       console.log(`[sync] Resolved response column: "${payload.responseColumnId}" -> ${responseColumnId}`);
     }
 
+    // Resolve slugFieldId (accepts both column name and ID)
+    let resolvedSlugFieldId = payload.slugFieldId;
+    try {
+      resolvedSlugFieldId = await resolveColumnNameOrId(
+        payload.docId,
+        payload.tableIdOrName,
+        payload.slugFieldId,
+        codaApiToken,
+      );
+      if (resolvedSlugFieldId !== payload.slugFieldId) {
+        console.log(`[sync] Resolved slug field: "${payload.slugFieldId}" -> ${resolvedSlugFieldId}`);
+      }
+    } catch (error) {
+      console.error(`[sync] Failed to resolve slug field: ${error.message}`);
+      // If resolution fails, use the original value (it might already be an ID)
+      resolvedSlugFieldId = payload.slugFieldId;
+    }
+
     console.log(`[sync] Coda data:`, {
       columnsCount: tableData.columns.length,
       rowsCount: tableData.rows.length,
-      slugFieldId: payload.slugFieldId,
+      slugFieldId: resolvedSlugFieldId,
       responseColumnId,
       columnIds: tableData.columns.map(c => c.id),
       firstRowValues: tableData.rows[0]?.values,
@@ -145,7 +163,7 @@ export default async function handler(req, res) {
     const mappingResult = buildFieldsAndItems({
       columns,
       rows,
-      slugFieldId: payload.slugFieldId,
+      slugFieldId: resolvedSlugFieldId,
       use12HourTime: payload.use12HourTime !== false, // Default to true (12-hour format)
     });
 
