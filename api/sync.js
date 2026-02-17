@@ -213,11 +213,21 @@ export default async function handler(req, res) {
     console.log(`[sync] Final response:`, responseBody);
     return sendJson(res, 200, responseBody);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[sync] Error:`, message, error);
-    return sendJson(res, 500, {
-      error: "SYNC_FAILED",
-      message,
-    });
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error(`[sync] Error:`, errorMsg, error);
+    
+    // Return error in response body so it shows in the Response column
+    const errorResponse = {
+      success: false,
+      collectionId: "",
+      collectionName: "",
+      itemsAdded: 0,
+      fieldsSet: 0,
+      warnings: [],
+      published: false,
+      deploymentId: "",
+      message: `❌ Sync failed: ${errorMsg}`,
+    };
+    return sendJson(res, 200, errorResponse);
   }
 }
