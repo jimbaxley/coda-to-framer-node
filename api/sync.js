@@ -1,4 +1,4 @@
-import { getCodaTableData, resolveColumnNameOrId, updateTableCell } from "../lib/coda-client.js";
+import { getCodaTableData, resolveColumnNameOrId } from "../lib/coda-client.js";
 import {
   normalizeColumns,
   normalizeRows,
@@ -116,18 +116,6 @@ export default async function handler(req, res) {
       payload.rowLimit || 100,
     );
 
-    // Resolve responseColumnId if provided
-    let responseColumnId = null;
-    if (payload.responseColumnId) {
-      responseColumnId = await resolveColumnNameOrId(
-        payload.docId,
-        payload.tableIdOrName,
-        payload.responseColumnId,
-        codaApiToken,
-      );
-      console.log(`[sync] Resolved response column: "${payload.responseColumnId}" -> ${responseColumnId}`);
-    }
-
     // Resolve slugFieldId (accepts both column name and ID)
     let resolvedSlugFieldId = payload.slugFieldId;
     if (payload.slugFieldId) {
@@ -146,9 +134,7 @@ export default async function handler(req, res) {
       columnsCount: tableData.columns.length,
       rowsCount: tableData.rows.length,
       slugFieldId: resolvedSlugFieldId,
-      responseColumnId,
       columnIds: tableData.columns.map(c => c.id),
-      columnNames: tableData.columns.map(c => c.name),
       firstRowValues: tableData.rows[0]?.values,
     });
 
@@ -220,35 +206,11 @@ export default async function handler(req, res) {
       warnings: mappingResult.warnings,
       published: publishResult?.published ?? false,
       deploymentId: publishResult?.deploymentId ?? "",
-      responseColumnId,
       message: publishResult?.published 
         ? `✅ Synced ${mappingResult.items.length} items to "${collection.collectionName}" and published (deployment: ${publishResult.deploymentId}).`
         : `✅ Synced ${mappingResult.items.length} items to "${collection.collectionName}".`,
     };
     console.log(`[sync] Final response:`, responseBody);
-
-    // Update the response column in the specified row if both rowId and responseColumnId are provided
-    if (payload.rowId && responseColumnId) {
-      try {
-        console.log(`[sync] Updating row ${payload.rowId}, column ${responseColumnId} with response...`);
-        await updateTableCell(
-          payload.docId,
-          payload.tableIdOrName,
-          payload.rowId,
-          responseColumnId,
-          JSON.stringify(responseBody),
-          codaApiToken,
-        );
-        console.log(`[sync] Cell updated successfully`);
-      } catch (updateError) {
-        const updateErrorMsg = updateError instanceof Error ? updateError.message : String(updateError);
-        console.error(`[sync] Failed to update response cell: ${updateErrorMsg}`);
-        // Don't fail the sync if cell update fails - just log the error
-        responseBody.warnings = responseBody.warnings || [];
-        responseBody.warnings.push(`Warning: Could not write response to column: ${updateErrorMsg}`);
-      }
-    }
-
     return sendJson(res, 200, responseBody);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
