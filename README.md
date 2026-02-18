@@ -22,6 +22,7 @@ Body:
   "collectionName": "...",
   "slugFieldId": "...",
   "rowLimit": 100,
+  "deleteMissing": true,
   "rowId": "C-AB012345",
   "action": "rowSync"
 }
@@ -29,3 +30,4 @@ Body:
 
 - If `rowId` is provided (or `action` is `rowSync`), the API fetches and syncs only that row. `rowId` may be an API row ID (`i-...`) or a unique slug selector value from `slugFieldId`.
 - Otherwise, it performs table sync using `rowLimit`.
+- For table sync, set `deleteMissing: true` to remove managed collection items that are no longer present in the Coda table snapshot.

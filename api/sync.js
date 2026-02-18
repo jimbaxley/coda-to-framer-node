@@ -10,11 +10,19 @@ import {
 } from "../lib/mapping.js";
 import {
   getOrCreateManagedCollection,
+  getCollectionFields,
   getCollectionFieldIds,
+  getManagedCollectionItemIds,
+  removeItemsFromManagedCollection,
   setCollectionFields,
   addItemsToCollection,
   publishProject,
 } from "../lib/framer-client.js";
+import {
+  sleep,
+  parseIntEnv,
+  shouldRetryForTransientCodaWarnings,
+} from "../lib/retry-policy.js";
 
 function sendJson(res, status, body) {
   res.statusCode = status;
@@ -113,7 +121,10 @@ export default async function handler(req, res) {
       tableIdOrName: payload.tableIdOrName,
       rowId: payload.rowId,
       collectionName: payload.collectionName,
+      slugFieldId: payload.slugFieldId,
+      rowLimit: payload.rowLimit,
       publish: payload.publish,
+      deleteMissing: payload.deleteMissing,
       action: payload.action,
     });
 
@@ -200,73 +211,106 @@ export default async function handler(req, res) {
       }
     }
 
-    let tableData;
-    if (isRowSync) {
-      if (isApiRowId(payload.rowId)) {
-        try {
-          tableData = await getCodaRowData(
+    const getCodaSnapshot = async () => {
+      let tableData;
+      if (isRowSync) {
+        if (isApiRowId(payload.rowId)) {
+          try {
+            tableData = await getCodaRowData(
+              payload.docId,
+              payload.tableIdOrName,
+              payload.rowId,
+              codaApiToken,
+            );
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[sync] Direct API row lookup failed (${message}). Falling back to selector lookup.`);
+          }
+        }
+
+        if (!tableData) {
+          const selectorData = await getCodaTableData(
             payload.docId,
             payload.tableIdOrName,
-            payload.rowId,
             codaApiToken,
+            payload.rowLimit || 500,
           );
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.warn(`[sync] Direct API row lookup failed (${message}). Falling back to selector lookup.`);
+          const matchedRow = findRowBySelector(selectorData, payload.rowId, resolvedSlugFieldId);
+          if (!matchedRow) {
+            const normalizedSelector = normalizeSelectorValue(payload.rowId);
+            throw new Error(
+              `Row not found for selector "${normalizedSelector}". Pass API row ID (i-...) or unique slug value from the slug field.`,
+            );
+          }
+          tableData = {
+            columns: selectorData.columns,
+            rows: [matchedRow],
+          };
         }
-      }
-
-      if (!tableData) {
-        const selectorData = await getCodaTableData(
+      } else {
+        tableData = await getCodaTableData(
           payload.docId,
           payload.tableIdOrName,
           codaApiToken,
-          payload.rowLimit || 500,
+          payload.rowLimit || 100,
         );
-        const matchedRow = findRowBySelector(selectorData, payload.rowId, resolvedSlugFieldId);
-        if (!matchedRow) {
-          const normalizedSelector = normalizeSelectorValue(payload.rowId);
-          throw new Error(
-            `Row not found for selector "${normalizedSelector}". Pass API row ID (i-...) or unique slug value from the slug field.`,
-          );
-        }
-        tableData = {
-          columns: selectorData.columns,
-          rows: [matchedRow],
-        };
       }
-    } else {
-      tableData = await getCodaTableData(
-        payload.docId,
-        payload.tableIdOrName,
-        codaApiToken,
-        payload.rowLimit || 100,
+
+      console.log(`[sync] Coda data:`, {
+        columnsCount: tableData.columns.length,
+        rowsCount: tableData.rows.length,
+        slugFieldId: resolvedSlugFieldId,
+        columnIds: tableData.columns.map(c => c.id),
+        firstRowValues: tableData.rows[0]?.values,
+      });
+
+      const columns = normalizeColumns(tableData.columns);
+      const rows = normalizeRows(tableData.rows);
+
+      console.log(`[sync] Fetched ${rows.length} rows, ${columns.length} columns from Coda (${isRowSync ? "rowSync" : "tableSync"})`);
+
+      const mappingResult = buildFieldsAndItems({
+        columns,
+        rows,
+        slugFieldId: resolvedSlugFieldId,
+        use12HourTime: payload.use12HourTime !== false, // Default to true (12-hour format)
+      });
+
+      console.log(`[sync] Mapping result: ${mappingResult.items.length} items, ${mappingResult.skippedCount} skipped, ${mappingResult.warnings.length} warnings`);
+      if (mappingResult.warnings.length > 0) {
+        console.log(`[sync] Warnings:`, mappingResult.warnings);
+      }
+
+      return mappingResult;
+    };
+
+    const maxCodaStateRetries = parseIntEnv(
+      process.env.CODA_STATE_RETRY_ATTEMPTS || 3,
+      3,
+      1,
+      6,
+    );
+    const codaStateRetryDelayMs = parseIntEnv(
+      process.env.CODA_STATE_RETRY_DELAY_MS || 1200,
+      1200,
+      0,
+      10000,
+    );
+
+    let mappingResult;
+    for (let attempt = 1; attempt <= maxCodaStateRetries; attempt += 1) {
+      mappingResult = await getCodaSnapshot();
+
+      const retryableWarning = shouldRetryForTransientCodaWarnings(mappingResult.warnings);
+      if (!retryableWarning || attempt === maxCodaStateRetries) {
+        break;
+      }
+
+      const delayMs = codaStateRetryDelayMs * attempt;
+      console.warn(
+        `[sync] Transient Coda warning detected (attempt ${attempt}/${maxCodaStateRetries}): retrying Coda snapshot in ${delayMs}ms`,
       );
-    }
-
-    console.log(`[sync] Coda data:`, {
-      columnsCount: tableData.columns.length,
-      rowsCount: tableData.rows.length,
-      slugFieldId: resolvedSlugFieldId,
-      columnIds: tableData.columns.map(c => c.id),
-      firstRowValues: tableData.rows[0]?.values,
-    });
-
-    const columns = normalizeColumns(tableData.columns);
-    const rows = normalizeRows(tableData.rows);
-
-    console.log(`[sync] Fetched ${rows.length} rows, ${columns.length} columns from Coda (${isRowSync ? "rowSync" : "tableSync"})`);
-
-    const mappingResult = buildFieldsAndItems({
-      columns,
-      rows,
-      slugFieldId: resolvedSlugFieldId,
-      use12HourTime: payload.use12HourTime !== false, // Default to true (12-hour format)
-    });
-
-    console.log(`[sync] Mapping result: ${mappingResult.items.length} items, ${mappingResult.skippedCount} skipped, ${mappingResult.warnings.length} warnings`);
-    if (mappingResult.warnings.length > 0) {
-      console.log(`[sync] Warnings:`, mappingResult.warnings);
+      await sleep(delayMs);
     }
 
     const collection = await getOrCreateManagedCollection(
@@ -292,6 +336,57 @@ export default async function handler(req, res) {
 
     if (mappingResult.items.length > 0) {
       let itemsToAdd = mappingResult.items;
+      let existingItemIds = [];
+
+      try {
+        existingItemIds = await getManagedCollectionItemIds(
+          payload.framerProjectUrl,
+          framerApiKey,
+          collection.collectionId,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[sync] Could not fetch existing item ids before add: ${message}`);
+      }
+
+      const codaFieldIdToName = new Map(
+        mappingResult.fields.map((field) => [field.id, field.name]),
+      );
+      const collectionFields = await getCollectionFields(
+        payload.framerProjectUrl,
+        framerApiKey,
+        collection.collectionId,
+      );
+      const collectionFieldNameToId = new Map(
+        collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
+      );
+
+      itemsToAdd = mappingResult.items.map((item) => {
+        const remappedFieldData = {};
+        const originalFieldData = item?.fieldData || {};
+
+        for (const [sourceFieldId, fieldValue] of Object.entries(originalFieldData)) {
+          const sourceFieldName = codaFieldIdToName.get(sourceFieldId);
+          if (!sourceFieldName) continue;
+          const targetFieldId = collectionFieldNameToId.get(String(sourceFieldName).toLowerCase());
+          if (!targetFieldId) continue;
+          remappedFieldData[targetFieldId] = fieldValue;
+        }
+
+        return {
+          ...item,
+          fieldData: remappedFieldData,
+        };
+      });
+
+      const originalCount = Object.keys(mappingResult.items[0]?.fieldData || {}).length;
+      const remappedCount = Object.keys(itemsToAdd[0]?.fieldData || {}).length;
+      if (remappedCount < originalCount) {
+        console.log(
+          `[sync] Remapped item fields by name: removed ${originalCount - remappedCount} unmapped key(s)`,
+        );
+      }
+
       if (isRowSync && !collection.created) {
         const allowedFieldIds = new Set(
           await getCollectionFieldIds(
@@ -315,7 +410,6 @@ export default async function handler(req, res) {
           };
         });
 
-        const originalCount = Object.keys(mappingResult.items[0]?.fieldData || {}).length;
         const filteredCount = Object.keys(itemsToAdd[0]?.fieldData || {}).length;
         if (filteredCount < originalCount) {
           console.log(
@@ -332,8 +426,54 @@ export default async function handler(req, res) {
         itemsToAdd,
       );
       console.log(`[sync] Items added successfully`);
+
+      try {
+        const afterItemIds = await getManagedCollectionItemIds(
+          payload.framerProjectUrl,
+          framerApiKey,
+          collection.collectionId,
+        );
+        const beforeSet = new Set(existingItemIds);
+        const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
+        const expectedNewIds = Array.from(submittedIds).filter((id) => !beforeSet.has(id));
+        const afterSet = new Set(afterItemIds);
+        const missingNewIds = expectedNewIds.filter((id) => !afterSet.has(id));
+
+        if (missingNewIds.length > 0) {
+          const warning = `Submitted ${itemsToAdd.length} items, but ${missingNewIds.length} expected new id(s) were not present after add: ${missingNewIds.join(", ")}`;
+          mappingResult.warnings.push(warning);
+          console.warn(`[sync] ${warning}`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[sync] Could not verify item ids after add: ${message}`);
+      }
     } else {
       console.log(`[sync] No items to add`);
+    }
+
+    let itemsRemoved = 0;
+    if (!isRowSync && payload.deleteMissing) {
+      const codaItemIds = new Set(mappingResult.items.map((item) => String(item.id)));
+      const managedItemIds = await getManagedCollectionItemIds(
+        payload.framerProjectUrl,
+        framerApiKey,
+        collection.collectionId,
+      );
+      const toRemove = managedItemIds.filter((id) => !codaItemIds.has(String(id)));
+
+      if (toRemove.length > 0) {
+        console.log(`[sync] Removing ${toRemove.length} item(s) not present in Coda table snapshot...`);
+        itemsRemoved = await removeItemsFromManagedCollection(
+          payload.framerProjectUrl,
+          framerApiKey,
+          collection.collectionId,
+          toRemove,
+        );
+        console.log(`[sync] Removed ${itemsRemoved} stale item(s)`);
+      } else {
+        console.log(`[sync] deleteMissing enabled: no stale items to remove`);
+      }
     }
 
     let publishResult = null;
@@ -353,13 +493,14 @@ export default async function handler(req, res) {
       collectionId: collection.collectionId,
       collectionName: collection.collectionName,
       itemsAdded: mappingResult.items.length,
+      itemsRemoved,
       fieldsSet,
       warnings: mappingResult.warnings,
       published: publishResult?.published ?? false,
       deploymentId: publishResult?.deploymentId ?? "",
       message: publishResult?.published 
-        ? `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"} to "${collection.collectionName}" and published (deployment: ${publishResult.deploymentId}).`
-        : `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"} to "${collection.collectionName}".`,
+        ? `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""} to "${collection.collectionName}" and published (deployment: ${publishResult.deploymentId}).`
+        : `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""} to "${collection.collectionName}".`,
     };
     console.log(`[sync] Final response:`, responseBody);
     return sendJson(res, 200, responseBody);
@@ -373,6 +514,7 @@ export default async function handler(req, res) {
       collectionId: "",
       collectionName: "",
       itemsAdded: 0,
+      itemsRemoved: 0,
       fieldsSet: 0,
       warnings: [],
       published: false,
