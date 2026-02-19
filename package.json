@@ -6,7 +6,11 @@
   "engines": {
     "node": ">=18"
   },
+  "scripts": {
+    "cleanup-logs": "node scripts/cleanup-duplicate-logs.js"
+  },
   "dependencies": {
+    "@vercel/functions": "^2.2.13",
     "framer-api": "^0.1.1",
     "marked": "^12.0.2",
     "sanitize-html": "^2.13.0"

@@ -22,28 +22,118 @@ Optional retry/fallback tuning:
 - `FRAMER_ADD_CHUNK_SIZE` - chunk size used after bulk add timeout fallback (default: `2`)
 - `FRAMER_ADD_CHUNK_TIMEOUT_MS` - timeout for each chunk fallback add call (default: min(operation timeout, `12000`))
 - `FRAMER_ADD_PER_ITEM_TIMEOUT_MS` - timeout for final per-item fallback adds (default: min(operation timeout, `8000`))
+- `CODA_INITIAL_DELAY_MS` - initial delay before extraction to allow recent Coda UI edits to become API-visible (default: `1200`)
 
 ## Endpoint
 
 POST `/api/sync`
 
+Returns immediately with HTTP `202` when request is accepted. Sync runs asynchronously in the background.
+
 Body:
 ```
 {
+  "requestId": "req_...",
+  "idempotencyKey": "optional-dedupe-key",
   "docId": "...",
   "tableIdOrName": "...",
   "framerProjectUrl": "https://framer.com/projects/...",
   "collectionName": "...",
   "slugFieldId": "...",
   "rowLimit": 100,
+  "initialDelayMs": 1500,
   "deleteMissing": true,
   "rowId": "C-AB012345",
+  "callback": {
+    "statusDocId": "...",
+    "statusTableIdOrName": "...",
+    "statusRow": "i-... or slug value",
+    "statusRowSelector": "i-... or slug value",
+    "statusColumn": "Sync Status or c-...",
+    "statusColumnNameOrId": "Sync Status or c-...",
+    "statusSlugField": "slug column name or id used for selector matching",
+    "statusSlugFieldId": "slug column name or id used for selector matching",
+    "messageColumnId": "c-...",
+    "sourceStatusColumnId": "c-..."
+  },
   "action": "rowSync"
 }
 ```
+
+Accepted response:
+
+```json
+{
+  "accepted": true,
+  "jobId": "...",
+  "requestId": "...",
+  "status": "queued",
+  "statusUrl": "/api/sync?jobId=..."
+}
+```
+
+Status endpoint:
+
+- `GET /api/sync?jobId=...` returns current job status plus stage events.
+- Status lookup is **best-effort** in the current in-memory model; a `NOT_FOUND` can occur if requests hit different serverless instances.
 
 - If `rowId` is provided (or `action` is `rowSync`), the API fetches and syncs only that row. `rowId` may be an API row ID (`i-...`) or a unique slug selector value from `slugFieldId`.
 - Otherwise, it performs table sync using `rowLimit`.
 - For table sync, set `deleteMissing: true` to remove managed collection items that are no longer present in the Coda table snapshot.
 - When Coda returns transient empty slug values during recent UI edits, the handler retries Coda snapshot/mapping before returning warnings.
+- `initialDelayMs` (or env default `CODA_INITIAL_DELAY_MS`) is applied before extract to mitigate Coda UI/API propagation lag.
 - When Framer bulk add times out, the handler falls back to chunked adds first, then per-item only for failed chunks.
+
+## Coda maker callback quick-start
+
+For most maker setups, send friendly callback values (no ID hunting required):
+
+```json
+{
+  "callback": {
+    "statusDocId": "<docId>",
+    "statusTableIdOrName": "MyTable",
+    "statusRow": "my-slug-or-row-id",
+    "statusColumn": "Sync Status",
+    "statusSlugField": "Short Name"
+  }
+}
+```
+
+- `statusRow` can be selector value or `i-...`.
+- `statusColumn` can be column name or `c-...`.
+- `statusSlugField` helps row selector matching when not passing API row IDs.
+
+## Advanced callback payload
+
+### What is implemented now
+
+- Backend callback writes are performed by direct Coda API calls using `CODA_API_TOKEN`.
+- Current writeback implementation updates one target status cell when these fields are present:
+  - `callback.statusDocId`
+  - `callback.statusTableIdOrName`
+  - `callback.statusRowSelector` (API row ID or selector)
+  - `callback.statusColumnNameOrId` (column name or ID)
+
+### Required Coda-side inputs
+
+- `statusRowSelector` may be API row ID (`i-...`) or a selector value.
+- `statusColumnNameOrId` may be a Coda column name or ID.
+- For selector-based row resolution, provide `statusSlugFieldId` (name or ID) when needed.
+- Alias keys `statusRow`, `statusColumn`, and `statusSlugField` are also supported.
+- If row/column IDs are unavailable, use the async status endpoint (`GET /api/sync?jobId=...`) and poll from Coda via pack formula.
+
+### Notes on extra callback fields
+
+- `messageColumnId` and `sourceStatusColumnId` may be sent by the pack for forward compatibility.
+- They are currently reserved metadata and are not yet written by backend callback logic.
+
+## Webhook note
+
+- No inbound webhook receiver endpoint is required for current callback behavior.
+- If you want a webhook-based fan-out pattern later, add a dedicated endpoint and post job events to it from the async worker.
+
+## Reliability note (current model)
+
+- Background processing now prefers `waitUntil` when available and falls back to `setTimeout`.
+- Job tracking is still in-memory, so use callback writes to Coda as the primary source of truth for maker-visible status.

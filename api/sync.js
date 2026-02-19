@@ -1,7 +1,14 @@
+import { randomUUID } from "node:crypto";
+import { waitUntil as vercelWaitUntil } from "@vercel/functions";
 import {
   getCodaTableData,
   getCodaRowData,
+  getCodaTableColumns,
   resolveColumnNameOrId,
+  resolveTableNameOrId,
+  updateTableCell,
+  updateTableRowCells,
+  createTableRow,
 } from "../lib/coda-client.js";
 import {
   normalizeColumns,
@@ -23,11 +30,106 @@ import {
   parseIntEnv,
   shouldRetryForTransientCodaWarnings,
 } from "../lib/retry-policy.js";
+import {
+  createJob,
+  getJobWithEvents,
+  listJobsWithEvents,
+  updateJob,
+  appendJobEvent,
+  findActiveJobByIdempotency,
+  getJob,
+} from "../lib/job-store.js";
 
 function sendJson(res, status, body) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify(body));
+}
+
+function log(level, event, fields = {}) {
+  const record = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...fields,
+  };
+  const line = JSON.stringify(record);
+  if (level === "error") {
+    console.error(line);
+    return;
+  }
+  if (level === "warn") {
+    console.warn(line);
+    return;
+  }
+  console.log(line);
+}
+
+function getWaitUntil(req, res) {
+  if (typeof vercelWaitUntil === "function") {
+    return vercelWaitUntil;
+  }
+  if (typeof req?.waitUntil === "function") {
+    return req.waitUntil.bind(req);
+  }
+  if (typeof res?.waitUntil === "function") {
+    return res.waitUntil.bind(res);
+  }
+  if (typeof globalThis.waitUntil === "function") {
+    return globalThis.waitUntil.bind(globalThis);
+  }
+  return null;
+}
+
+function scheduleJobProcessing({ req, res, jobId, requestId }) {
+  const run = async () => {
+    try {
+      await processJob(jobId);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      appendJobEvent(jobId, {
+        level: "error",
+        stage: "failed",
+        message: "Unhandled async processing failure",
+        details: { error: errorMessage },
+      });
+      updateJob(jobId, {
+        status: "failed",
+        completedAt: new Date().toISOString(),
+        error: errorMessage,
+        result: makeFailureResponse(errorMessage),
+      });
+      log("error", "background_failed", {
+        jobId,
+        requestId,
+        error: errorMessage,
+      });
+    }
+  };
+
+  const waitUntil = getWaitUntil(req, res);
+  if (waitUntil) {
+    log("info", "background_scheduled_waitUntil", {
+      jobId,
+      requestId,
+      strategy: "vercel_or_runtime",
+    });
+    waitUntil(run());
+    return;
+  }
+
+  log("warn", "background_scheduled_setTimeout", {
+    jobId,
+    requestId,
+  });
+  setTimeout(() => {
+    run();
+  }, 0);
+}
+
+function parseJobIdFromRequest(req) {
+  const requestUrl = new URL(req.url || "", "http://localhost");
+  return requestUrl.searchParams.get("jobId") || "";
 }
 
 function normalizeSelectorValue(value) {
@@ -106,29 +208,966 @@ async function readJsonBody(req) {
   return JSON.parse(raw);
 }
 
+function makeFailureResponse(errorMessage) {
+  return {
+    success: false,
+    collectionId: "",
+    collectionName: "",
+    itemsAdded: 0,
+    itemsRemoved: 0,
+    fieldsSet: 0,
+    warnings: [],
+    published: false,
+    deploymentId: "",
+    message: `❌ Sync failed: ${errorMessage}`,
+  };
+}
+
+function getDefaultCallbackTableName() {
+  return String(process.env.CODA_CALLBACK_TABLE_NAME || "Framer Sync Log").trim();
+}
+
+async function provisionCallbackRowIfNeeded(payload, { requestId, jobId, vercelTrace }) {
+  const callback = payload?.callback || {};
+  const hasExplicitCallbackTable = Object.prototype.hasOwnProperty.call(callback, "statusTableIdOrName")
+    || Object.prototype.hasOwnProperty.call(callback, "statusTableInput");
+  const defaultCallbackTableName = getDefaultCallbackTableName();
+  let callbackTableValue = callback.statusTableIdOrName || callback.statusTableInput || "";
+  if (hasExplicitCallbackTable && !callbackTableValue && defaultCallbackTableName) {
+    callbackTableValue = defaultCallbackTableName;
+  }
+  const hasCallbackTable = Boolean(callbackTableValue);
+  if (hasExplicitCallbackTable && !hasCallbackTable) {
+    log("warn", "callback_row_autocreate_skipped", {
+      requestId,
+      jobId,
+      reason: "explicit_callback_table_unresolved",
+      vercelTrace,
+    });
+    return payload;
+  }
+  if (!hasCallbackTable) {
+    return payload;
+  }
+
+  // Do not auto-create an initial callback/log row at request time.
+  // Instead, resolve the callback target (doc/table/column) so the
+  // writeStatusCallback can create the final log row when the job completes.
+
+  const statusDocId = callback.statusDocId || payload.docId || "";
+  const statusTableIdOrName = callbackTableValue || payload.tableIdOrName || "";
+  const statusColumnNameOrId = callback.statusColumn || callback.statusColumnId || callback.statusColumnNameOrId || "Status";
+
+  if (!statusDocId || !statusTableIdOrName || !statusColumnNameOrId) {
+    // Nothing for the backend to do now — leave payload unchanged.
+    return payload;
+  }
+
+  const codaApiToken = process.env.CODA_API_TOKEN;
+  if (!codaApiToken) {
+    return payload;
+  }
+
+  try {
+    const resolvedStatusTableId = await resolveTableNameOrId(
+      statusDocId,
+      statusTableIdOrName,
+      codaApiToken,
+    );
+
+    const resolvedStatusColumnId = await resolveColumnNameOrId(
+      statusDocId,
+      resolvedStatusTableId,
+      statusColumnNameOrId,
+      codaApiToken,
+    );
+
+    // Return the payload with resolved table/column ids but do NOT create a row.
+    const nextCallback = {
+      ...callback,
+      statusDocId,
+      statusTableIdOrName: resolvedStatusTableId,
+      statusTableInput: statusTableIdOrName,
+      statusColumn: resolvedStatusColumnId,
+      statusColumnNameOrId: resolvedStatusColumnId,
+    };
+
+    return {
+      ...payload,
+      callback: nextCallback,
+    };
+  } catch (error) {
+    // If resolution fails, just return the original payload — writeStatusCallback
+    // will skip or fail gracefully at completion.
+    return payload;
+  }
+}
+
+async function executeSyncWorkflow(payload, eventLogger) {
+  const codaApiToken = process.env.CODA_API_TOKEN;
+  if (!codaApiToken) {
+    throw new Error("CODA_API_TOKEN is not configured");
+  }
+
+  const framerApiKey = process.env.FRAMER_API_KEY || payload.framerApiKey;
+  if (!framerApiKey) {
+    throw new Error("Missing Framer API key");
+  }
+
+  const isRowSync = payload.action === "rowSync" || Boolean(payload.rowId);
+  if (isRowSync && !payload.rowId) {
+    throw new Error("Missing required field for rowSync: rowId");
+  }
+
+  let resolvedSlugFieldId = payload.slugFieldId;
+  if (payload.slugFieldId) {
+    resolvedSlugFieldId = await resolveColumnNameOrId(
+      payload.docId,
+      payload.tableIdOrName,
+      payload.slugFieldId,
+      codaApiToken,
+    );
+    if (resolvedSlugFieldId !== payload.slugFieldId) {
+      eventLogger("info", "resolve_slug", "Resolved slug field ID", {
+        before: payload.slugFieldId,
+        after: resolvedSlugFieldId,
+      });
+    }
+  }
+
+  const getCodaSnapshot = async () => {
+    let tableData;
+    if (isRowSync) {
+      if (isApiRowId(payload.rowId)) {
+        try {
+          tableData = await getCodaRowData(
+            payload.docId,
+            payload.tableIdOrName,
+            payload.rowId,
+            codaApiToken,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          eventLogger("warning", "extract", "Direct row lookup failed; falling back to selector", {
+            message,
+          });
+        }
+      }
+
+      if (!tableData) {
+        const selectorData = await getCodaTableData(
+          payload.docId,
+          payload.tableIdOrName,
+          codaApiToken,
+          payload.rowLimit || 500,
+        );
+        const matchedRow = findRowBySelector(selectorData, payload.rowId, resolvedSlugFieldId);
+        if (!matchedRow) {
+          const normalizedSelector = normalizeSelectorValue(payload.rowId);
+          throw new Error(
+            `Row not found for selector "${normalizedSelector}". Pass API row ID (i-...) or unique slug value from the slug field.`,
+          );
+        }
+        tableData = {
+          columns: selectorData.columns,
+          rows: [matchedRow],
+        };
+      }
+    } else {
+      tableData = await getCodaTableData(
+        payload.docId,
+        payload.tableIdOrName,
+        codaApiToken,
+        payload.rowLimit || 100,
+      );
+    }
+
+    const columns = normalizeColumns(tableData.columns);
+    const rows = normalizeRows(tableData.rows);
+
+    const mappingResult = buildFieldsAndItems({
+      columns,
+      rows,
+      slugFieldId: resolvedSlugFieldId,
+      use12HourTime: payload.use12HourTime !== false,
+    });
+
+    return mappingResult;
+  };
+
+  const maxCodaStateRetries = parseIntEnv(
+    process.env.CODA_STATE_RETRY_ATTEMPTS || 3,
+    3,
+    1,
+    6,
+  );
+  const codaStateRetryDelayMs = parseIntEnv(
+    process.env.CODA_STATE_RETRY_DELAY_MS || 1200,
+    1200,
+    0,
+    10000,
+  );
+
+  eventLogger("info", "extract", "Fetching Coda snapshot", {
+    isRowSync,
+    tableIdOrName: payload.tableIdOrName,
+  });
+
+  let mappingResult;
+  for (let attempt = 1; attempt <= maxCodaStateRetries; attempt += 1) {
+    mappingResult = await getCodaSnapshot();
+
+    const retryableWarning = shouldRetryForTransientCodaWarnings(mappingResult.warnings);
+    if (!retryableWarning || attempt === maxCodaStateRetries) {
+      break;
+    }
+
+    const delayMs = codaStateRetryDelayMs * attempt;
+    eventLogger("warning", "extract", "Transient Coda state detected; retrying snapshot", {
+      attempt,
+      maxCodaStateRetries,
+      delayMs,
+    });
+    await sleep(delayMs);
+  }
+
+  eventLogger("info", "framer_sync", "Ensuring managed collection", {
+    collectionName: payload.collectionName,
+  });
+
+  const collection = await getOrCreateManagedCollection(
+    payload.framerProjectUrl,
+    framerApiKey,
+    payload.collectionName,
+  );
+
+  let fieldsSet = 0;
+  if (!isRowSync || collection.created) {
+    fieldsSet = await setCollectionFields(
+      payload.framerProjectUrl,
+      framerApiKey,
+      collection.collectionId,
+      mappingResult.fields,
+    );
+  }
+
+  if (mappingResult.items.length > 0) {
+    let itemsToAdd = mappingResult.items;
+    let existingItemIds = [];
+
+    try {
+      existingItemIds = await getManagedCollectionItemIds(
+        payload.framerProjectUrl,
+        framerApiKey,
+        collection.collectionId,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      eventLogger("warning", "framer_sync", "Could not fetch existing item ids before add", {
+        message,
+      });
+    }
+
+    const codaFieldIdToName = new Map(
+      mappingResult.fields.map((field) => [field.id, field.name]),
+    );
+    const collectionFields = await getCollectionFields(
+      payload.framerProjectUrl,
+      framerApiKey,
+      collection.collectionId,
+    );
+    const collectionFieldNameToId = new Map(
+      collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
+    );
+
+    itemsToAdd = mappingResult.items.map((item) => {
+      const remappedFieldData = {};
+      const originalFieldData = item?.fieldData || {};
+
+      for (const [sourceFieldId, fieldValue] of Object.entries(originalFieldData)) {
+        const sourceFieldName = codaFieldIdToName.get(sourceFieldId);
+        if (!sourceFieldName) continue;
+        const targetFieldId = collectionFieldNameToId.get(String(sourceFieldName).toLowerCase());
+        if (!targetFieldId) continue;
+        remappedFieldData[targetFieldId] = fieldValue;
+      }
+
+      return {
+        ...item,
+        fieldData: remappedFieldData,
+      };
+    });
+
+    if (isRowSync && !collection.created) {
+      const allowedFieldIds = new Set(
+        await getCollectionFieldIds(
+          payload.framerProjectUrl,
+          framerApiKey,
+          collection.collectionId,
+        ),
+      );
+
+      itemsToAdd = mappingResult.items.map((item) => {
+        const filteredFieldData = {};
+        const originalFieldData = item?.fieldData || {};
+        for (const [fieldId, fieldValue] of Object.entries(originalFieldData)) {
+          if (allowedFieldIds.has(fieldId)) {
+            filteredFieldData[fieldId] = fieldValue;
+          }
+        }
+        return {
+          ...item,
+          fieldData: filteredFieldData,
+        };
+      });
+    }
+
+    await addItemsToCollection(
+      payload.framerProjectUrl,
+      framerApiKey,
+      collection.collectionId,
+      itemsToAdd,
+    );
+
+    try {
+      const afterItemIds = await getManagedCollectionItemIds(
+        payload.framerProjectUrl,
+        framerApiKey,
+        collection.collectionId,
+      );
+      const beforeSet = new Set(existingItemIds);
+      const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
+      const expectedNewIds = Array.from(submittedIds).filter((id) => !beforeSet.has(id));
+      const afterSet = new Set(afterItemIds);
+      const missingNewIds = expectedNewIds.filter((id) => !afterSet.has(id));
+
+      if (missingNewIds.length > 0) {
+        const warning = `Submitted ${itemsToAdd.length} items, but ${missingNewIds.length} expected new id(s) were not present after add: ${missingNewIds.join(", ")}`;
+        mappingResult.warnings.push(warning);
+        eventLogger("warning", "framer_sync", "Some submitted item IDs were not visible after add", {
+          missingNewIds,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      eventLogger("warning", "framer_sync", "Could not verify item ids after add", { message });
+    }
+  }
+
+  let itemsRemoved = 0;
+  if (!isRowSync && payload.deleteMissing) {
+    const codaItemIds = new Set(mappingResult.items.map((item) => String(item.id)));
+    const managedItemIds = await getManagedCollectionItemIds(
+      payload.framerProjectUrl,
+      framerApiKey,
+      collection.collectionId,
+    );
+    const toRemove = managedItemIds.filter((id) => !codaItemIds.has(String(id)));
+
+    if (toRemove.length > 0) {
+      itemsRemoved = await removeItemsFromManagedCollection(
+        payload.framerProjectUrl,
+        framerApiKey,
+        collection.collectionId,
+        toRemove,
+      );
+    }
+  }
+
+  let publishResult = null;
+  if (payload.publish) {
+    eventLogger("info", "publishing", "Publishing project");
+    publishResult = await publishProject(
+      payload.framerProjectUrl,
+      framerApiKey,
+    );
+  }
+
+  const responseBody = {
+    success: true,
+    collectionId: collection.collectionId,
+    collectionName: collection.collectionName,
+    itemsAdded: mappingResult.items.length,
+    itemsRemoved,
+    fieldsSet,
+    warnings: mappingResult.warnings,
+    published: publishResult?.published ?? false,
+    deploymentId: publishResult?.deploymentId ?? "",
+    message: publishResult?.published
+      ? `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""} to "${collection.collectionName}" and published (deployment: ${publishResult.deploymentId}).`
+      : `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""} to "${collection.collectionName}".`,
+  };
+
+  return responseBody;
+}
+
+function buildCallbackLogValues(job, message) {
+  const events = Array.isArray(job?.events) ? job.events : [];
+  const latestEvent = events.length > 0 ? events[events.length - 1] : null;
+  return {
+    "Job id": job?.jobId || "",
+    "Created at": job?.createdAt || "",
+    Error: job?.error || "",
+    "Items added": Number(job?.result?.itemsAdded || 0),
+    Status: job?.status || "",
+    Message: String(message || job?.result?.message || ""),
+    Action: job?.payload?.action || "sync",
+    "Collection name": String(job?.payload?.collectionName || ""),
+    "Completed at": job?.completedAt || "",
+    "Deployment id": String(job?.result?.deploymentId || ""),
+    Id: job?.jobId || "",
+    "Items removed": Number(job?.result?.itemsRemoved || 0),
+    "Latest event": String(latestEvent?.message || ""),
+    "Latest stage": String(latestEvent?.stage || ""),
+    "Publish requested": Boolean(job?.payload?.publish),
+    Published: Boolean(job?.result?.published),
+    "Request id": job?.requestId || "",
+    "Source table": String(job?.payload?.tableIdOrName || ""),
+    "Started at": job?.startedAt || "",
+    "Updated at": job?.updatedAt || "",
+    Success: Boolean(job?.result?.success),
+  };
+}
+
+async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = null) {
+  const callback = payload.callback || {};
+  const hasExplicitCallbackTable = Object.prototype.hasOwnProperty.call(callback, "statusTableIdOrName")
+    || Object.prototype.hasOwnProperty.call(callback, "statusTableInput");
+  const defaultCallbackTableName = getDefaultCallbackTableName();
+  const rawStatusColumnNameOrId = callback.statusColumn || callback.statusColumnId || callback.statusColumnNameOrId || "Status";
+  const rawStatusRowSelector = callback.statusRow || callback.statusRowId || callback.statusRowSelector || payload.rowId || "";
+  const rawStatusTableIdOrName = callback.statusTableIdOrName
+    || callback.statusTableInput
+    || (hasExplicitCallbackTable ? defaultCallbackTableName : (payload.tableIdOrName || ""));
+  const statusDocId = callback.statusDocId || payload.docId || "";
+
+  const statusColumnNameOrId = String(rawStatusColumnNameOrId || "").trim();
+  let statusRowSelector = String(rawStatusRowSelector || "").trim();
+  let statusTableIdOrName = String(rawStatusTableIdOrName || "").trim();
+
+  const looksLikeUnknownObject = (value) => {
+    const text = String(value || "").trim().toLowerCase();
+    return text.includes("[unknown object]") || text === "[object object]";
+  };
+
+  const extractCodaId = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return "";
+    const rowMatch = text.match(/(?:\/rows\/|\b)(i-[A-Za-z0-9_-]+)\b/);
+    if (rowMatch?.[1]) return rowMatch[1];
+    const tableMatch = text.match(/\b(grid-[A-Za-z0-9_-]+)\b/);
+    if (tableMatch?.[1]) return tableMatch[1];
+    const columnMatch = text.match(/\b(c-[A-Za-z0-9_-]+)\b/);
+    if (columnMatch?.[1]) return columnMatch[1];
+    return "";
+  };
+
+  if (looksLikeUnknownObject(statusTableIdOrName)) {
+    statusTableIdOrName = hasExplicitCallbackTable
+      ? String(defaultCallbackTableName || "").trim()
+      : String(payload.tableIdOrName || "").trim();
+  }
+
+  if (looksLikeUnknownObject(statusRowSelector)) {
+    statusRowSelector = "";
+  }
+
+  const extractedRowId = extractCodaId(statusRowSelector);
+  if (extractedRowId && isApiRowId(extractedRowId)) {
+    statusRowSelector = extractedRowId;
+  } else if (/^https?:\/\//i.test(statusRowSelector)) {
+    statusRowSelector = "";
+  }
+
+  // Require doc/table/column — a row selector is optional. If none is
+  // provided (or cannot be resolved), create the final log row now.
+  if (!statusColumnNameOrId || !statusTableIdOrName || !statusDocId) {
+    eventLogger("warning", "callback", "Skipped Coda status callback: missing callback target", {
+      hasStatusDocId: Boolean(statusDocId),
+      hasStatusTableIdOrName: Boolean(statusTableIdOrName),
+      hasStatusRowSelector: Boolean(statusRowSelector),
+      hasStatusColumnNameOrId: Boolean(statusColumnNameOrId),
+    });
+    return;
+  }
+
+  const codaApiToken = process.env.CODA_API_TOKEN;
+  if (!codaApiToken) {
+    eventLogger("warning", "callback", "Skipped Coda status callback: missing CODA_API_TOKEN");
+    return;
+  }
+
+  try {
+    const resolvedStatusTableId = await resolveTableNameOrId(
+      statusDocId,
+      statusTableIdOrName,
+      codaApiToken,
+    );
+
+    const resolvedStatusColumnId = await resolveColumnNameOrId(
+      statusDocId,
+      resolvedStatusTableId,
+      statusColumnNameOrId,
+      codaApiToken,
+    );
+
+    // Precompute table columns and the full set of log cells so we can create
+    // a single, complete log row if needed (avoids partial/duplicate rows).
+    const tableColumns = await getCodaTableColumns(
+      statusDocId,
+      resolvedStatusTableId,
+      codaApiToken,
+    );
+
+    const byLowerName = new Map(
+      tableColumns.map((column) => [String(column?.name || "").toLowerCase(), String(column?.id || "")]),
+    );
+
+    const messageColumnInput = callback.messageColumnId || callback.messageColumn || "";
+    let resolvedMessageColumnId = "";
+    if (messageColumnInput) {
+      try {
+        resolvedMessageColumnId = await resolveColumnNameOrId(
+          statusDocId,
+          resolvedStatusTableId,
+          messageColumnInput,
+          codaApiToken,
+        );
+      } catch (_) {
+        resolvedMessageColumnId = byLowerName.get("message") || "";
+      }
+    } else {
+      resolvedMessageColumnId = byLowerName.get("message") || "";
+    }
+
+    const jobData = jobSnapshot || {};
+    const logValues = buildCallbackLogValues(jobData, message);
+    const statusValue = String(jobData?.status || "").trim() || message;
+    const hasDedicatedMessageColumn = Boolean(resolvedMessageColumnId && resolvedMessageColumnId !== resolvedStatusColumnId);
+
+    const cellsToUpdate = [];
+    cellsToUpdate.push({
+      column: resolvedStatusColumnId,
+      value: hasDedicatedMessageColumn ? statusValue : message,
+    });
+    if (hasDedicatedMessageColumn) {
+      cellsToUpdate.push({ column: resolvedMessageColumnId, value: message });
+    }
+    for (const [columnName, value] of Object.entries(logValues)) {
+      const columnId = byLowerName.get(columnName.toLowerCase()) || "";
+      if (!columnId) continue;
+      if (columnId === resolvedStatusColumnId || columnId === resolvedMessageColumnId) continue;
+      cellsToUpdate.push({ column: columnId, value });
+    }
+
+    // Try to resolve an existing row if a selector was provided.
+    let resolvedStatusRowId = "";
+    if (statusRowSelector) {
+      if (isApiRowId(statusRowSelector)) {
+        resolvedStatusRowId = statusRowSelector;
+      } else {
+        let callbackSlugFieldId = callback.statusSlugField || callback.statusSlugFieldId || payload.slugFieldId || "";
+        if (callbackSlugFieldId) {
+          callbackSlugFieldId = await resolveColumnNameOrId(
+            statusDocId,
+            resolvedStatusTableId,
+            callbackSlugFieldId,
+            codaApiToken,
+          );
+        }
+
+        const rowSearchLimit = parseIntEnv(
+          callback.statusRowSearchLimit ?? 500,
+          500,
+          1,
+          500,
+        );
+
+        const callbackTableData = await getCodaTableData(
+          statusDocId,
+          resolvedStatusTableId,
+          codaApiToken,
+          rowSearchLimit,
+        );
+        const matchedRow = findRowBySelector(
+          callbackTableData,
+          statusRowSelector,
+          callbackSlugFieldId,
+        );
+        if (matchedRow?.id) {
+          resolvedStatusRowId = matchedRow.id;
+        }
+      }
+    }
+
+
+    // If no row was resolved, create a single final log row with ALL
+    // the collected cells (one-and-done). This avoids placeholder rows and
+    // eliminates the need to recreate or patch later.
+    let rowWasCreatedHere = false;
+    if (!resolvedStatusRowId) {
+      const created = await createTableRow(
+        statusDocId,
+        resolvedStatusTableId,
+        cellsToUpdate,
+        codaApiToken,
+      );
+      resolvedStatusRowId = created.rowId || "";
+      if (resolvedStatusRowId) {
+        rowWasCreatedHere = true;
+        eventLogger("info", "callback", "callback_row_autocreated", {
+          statusDocId,
+          statusTableIdOrName: resolvedStatusTableId,
+          statusColumnNameOrId,
+          rowSelector: resolvedStatusRowId,
+          usedRowId: true,
+        });
+        // allow brief eventual-consistency window before further ops
+        await sleep(300);
+      }
+    }
+
+    // If we just created the full row above, skip the single-cell update —
+    // creation already populated the status/message. Otherwise, attempt the
+    // faster single-cell update and tolerate a missing row until the main
+    // row-update routine runs below.
+    if (!rowWasCreatedHere) {
+      try {
+        await updateTableCell(
+          statusDocId,
+          resolvedStatusTableId,
+          resolvedStatusRowId,
+          resolvedStatusColumnId,
+          message,
+          codaApiToken,
+        );
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const isNotFound = (err && err.status === 404) || /404\s+Not\s+Found/i.test(errMsg) || /row not found/i.test(errMsg.toLowerCase());
+        if (isNotFound) {
+          // Row missing — log and continue; the robust row-update below will
+          // either populate or recreate the final log row as necessary.
+          eventLogger("info", "callback", "Callback row missing before single-cell update", {
+            statusDocId,
+            statusTableIdOrName: resolvedStatusTableId,
+            statusRowSelector,
+            resolvedStatusRowId,
+            statusColumnNameOrId,
+            resolvedStatusColumnId,
+            error: errMsg,
+          });
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      eventLogger("info", "callback", "Skipping single-cell update since rowWasCreatedHere is true");
+    }
+
+    // Attempt to update the row cells. Retry transient 404s that
+    // can occur immediately after row creation (eventual consistency).
+    const maxRowUpdateAttempts = parseIntEnv(process.env.CODA_CALLBACK_UPDATE_RETRY_ATTEMPTS || 5, 5, 1, 10);
+    let lastRowUpdateError = null;
+    for (let attempt = 1; attempt <= maxRowUpdateAttempts; attempt += 1) {
+      try {
+        await updateTableRowCells(
+          statusDocId,
+          resolvedStatusTableId,
+          resolvedStatusRowId,
+          cellsToUpdate,
+          codaApiToken,
+        );
+
+        eventLogger("info", "callback", "Updated Coda status cell", {
+          statusDocId,
+          statusTableIdOrName: resolvedStatusTableId,
+          statusRowSelector,
+          resolvedStatusRowId,
+          statusColumnNameOrId,
+          resolvedStatusColumnId,
+          attempt,
+        });
+        lastRowUpdateError = null;
+        break;
+      } catch (rowErr) {
+        lastRowUpdateError = rowErr;
+        const msg = rowErr instanceof Error ? rowErr.message : String(rowErr);
+        const isNotFound = (rowErr && rowErr.status === 404) || /404\s+Not\s+Found/i.test(msg) || /row not found/i.test(msg.toLowerCase());
+        eventLogger("warn", "callback", "Transient row-update failure", {
+          statusDocId,
+          resolvedStatusRowId,
+          attempt,
+          error: msg,
+        });
+        if (!isNotFound) {
+          // Non-404 failures should not be retried here
+          break;
+        }
+        // For 404, wait a short backoff and retry
+        await sleep(150 * attempt);
+
+        // If this was the last attempt, try recreating the row with the full
+        // set of cells to ensure data is persisted, then retry the update once.
+        if (attempt === maxRowUpdateAttempts) {
+          if (!rowWasCreatedHere) {
+            try {
+              const created = await createTableRow(
+                statusDocId,
+                resolvedStatusTableId,
+                // supply the same cells we intended to update
+                cellsToUpdate.map((c) => ({ column: c.column, value: c.value })),
+                codaApiToken,
+              );
+              const recreatedRowId = created.rowId || "";
+              if (recreatedRowId) {
+                resolvedStatusRowId = recreatedRowId;
+                eventLogger("info", "callback", "Recreated callback row with full cells", { recreatedRowId });
+                // Try updating again once more after recreate
+                await sleep(200);
+                await updateTableRowCells(
+                  statusDocId,
+                  resolvedStatusTableId,
+                  resolvedStatusRowId,
+                  cellsToUpdate,
+                  codaApiToken,
+                );
+
+                eventLogger("info", "callback", "Updated Coda status cell after recreate", {
+                  statusDocId,
+                  statusTableIdOrName: resolvedStatusTableId,
+                  statusRowSelector,
+                  resolvedStatusRowId,
+                  statusColumnNameOrId,
+                  resolvedStatusColumnId,
+                });
+                lastRowUpdateError = null;
+                break;
+              }
+            } catch (createErr) {
+              // fall through to final failure
+              lastRowUpdateError = createErr;
+            }
+          } else {
+            // Row was created by this function earlier; do not create a duplicate.
+            // Let the retry loop finish and surface the update failure instead.
+            eventLogger("warn", "callback", "Skipping recreate of callback row because rowWasCreatedHere is true");
+          }
+        }
+      }
+    }
+
+    if (lastRowUpdateError) {
+      throw lastRowUpdateError instanceof Error ? lastRowUpdateError : new Error(String(lastRowUpdateError));
+    }
+  } catch (error) {
+    const callbackError = error instanceof Error ? error.message : String(error);
+    eventLogger("warning", "callback", "Failed to update Coda status cell", {
+      callbackError,
+      statusDocId,
+      statusTableIdOrName,
+      statusRowSelector,
+      statusColumnNameOrId,
+    });
+  }
+}
+
+async function processJob(jobId) {
+  const job = getJob(jobId);
+  if (!job) {
+    return;
+  }
+
+  log("info", "job_started", {
+    jobId,
+    requestId: job.requestId,
+    action: job.payload?.action || "sync",
+    docId: job.payload?.docId,
+    tableIdOrName: job.payload?.tableIdOrName,
+  });
+
+  const eventLogger = (level, stage, message, details = {}) => {
+    appendJobEvent(jobId, { level, stage, message, details });
+    const normalizedLevel = level === "warning" ? "warn" : level;
+    log(normalizedLevel, "job_event", {
+      jobId,
+      requestId: job.requestId,
+      stage,
+      message,
+      details,
+    });
+  };
+
+  updateJob(jobId, {
+    status: "running",
+    startedAt: new Date().toISOString(),
+  });
+
+  const initialDelayMs = parseIntEnv(
+    job.payload.initialDelayMs ?? process.env.CODA_INITIAL_DELAY_MS ?? 1200,
+    1200,
+    0,
+    30000,
+  );
+
+  if (initialDelayMs > 0) {
+    updateJob(jobId, { status: "delayed" });
+    eventLogger("info", "delay", "Applying initial Coda visibility delay", { initialDelayMs });
+    await sleep(initialDelayMs);
+    updateJob(jobId, { status: "running" });
+  }
+
+  try {
+    const result = await executeSyncWorkflow(job.payload, eventLogger);
+    updateJob(jobId, {
+      status: result.published ? "published" : "succeeded",
+      completedAt: new Date().toISOString(),
+      result,
+      error: null,
+    });
+    eventLogger("info", "completed", "Job completed", {
+      success: result.success,
+      published: result.published,
+      itemsAdded: result.itemsAdded,
+      itemsRemoved: result.itemsRemoved,
+    });
+    const completedJob = getJobWithEvents(jobId) || getJob(jobId);
+    await writeStatusCallback(job.payload, result.message, eventLogger, completedJob);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const failure = makeFailureResponse(errorMessage);
+    updateJob(jobId, {
+      status: "failed",
+      completedAt: new Date().toISOString(),
+      result: failure,
+      error: errorMessage,
+    });
+    eventLogger("error", "failed", "Job failed", {
+      error: errorMessage,
+    });
+    const failedJob = getJobWithEvents(jobId) || getJob(jobId);
+    await writeStatusCallback(job.payload, failure.message, eventLogger, failedJob);
+  }
+}
+
+function validateSyncPayload(payload) {
+  const required = [
+    "docId",
+    "tableIdOrName",
+    "framerProjectUrl",
+    "collectionName",
+    "slugFieldId",
+  ];
+
+  for (const field of required) {
+    if (!payload[field]) {
+      return `Missing required field: ${field}`;
+    }
+  }
+
+  if (!process.env.CODA_API_TOKEN) {
+    return "CODA_API_TOKEN is not configured";
+  }
+
+  if (!(process.env.FRAMER_API_KEY || payload.framerApiKey)) {
+    return "Missing Framer API key";
+  }
+
+  return "";
+}
+
 export default async function handler(req, res) {
+  const requestUrl = new URL(req.url || "/api/sync", "http://localhost");
+  const vercelTrace = req?.headers?.["x-vercel-id"] || "";
+  const userAgent = req?.headers?.["user-agent"] || "";
+  log("info", "request_received", {
+    method: req.method,
+    path: requestUrl.pathname,
+    vercelTrace,
+    userAgent,
+  });
+
+  if (req.method === "GET") {
+    const listMode = requestUrl.searchParams.get("list") === "1"
+      || requestUrl.searchParams.get("mode") === "list"
+      || requestUrl.searchParams.get("syncTable") === "1";
+
+    if (listMode) {
+      const limit = parseIntEnv(
+        requestUrl.searchParams.get("limit") || 50,
+        50,
+        1,
+        200,
+      );
+      const cursor = parseIntEnv(
+        requestUrl.searchParams.get("cursor") || 0,
+        0,
+        0,
+        1000000,
+      );
+
+      const page = listJobsWithEvents({ limit, cursor });
+      log("info", "status_list", {
+        count: page.jobs.length,
+        limit,
+        cursor,
+        hasContinuation: Boolean(page.continuation?.cursor),
+        vercelTrace,
+      });
+
+      return sendJson(res, 200, {
+        success: true,
+        jobs: page.jobs,
+        continuation: page.continuation,
+        total: page.total,
+      });
+    }
+
+    const jobId = parseJobIdFromRequest(req);
+    if (!jobId) {
+      log("warn", "status_missing_jobId", {
+        vercelTrace,
+      });
+      return sendJson(res, 400, {
+        error: "INVALID_REQUEST",
+        message: "Missing required query param: jobId",
+      });
+    }
+
+    const job = getJobWithEvents(jobId);
+    if (!job) {
+      log("warn", "status_lookup_miss", {
+        jobId,
+        vercelTrace,
+      });
+      return sendJson(res, 404, {
+        error: "NOT_FOUND",
+        message: `No job found for jobId: ${jobId}`,
+      });
+    }
+
+    log("info", "status_lookup_hit", {
+      jobId,
+      requestId: job.requestId,
+      status: job.status,
+      vercelTrace,
+    });
+
+    return sendJson(res, 200, {
+      success: true,
+      job,
+    });
+  }
+
   if (req.method !== "POST") {
     return sendJson(res, 405, {
       error: "METHOD_NOT_ALLOWED",
-      message: "Use POST /api/sync",
+      message: "Use POST /api/sync or GET /api/sync?jobId=...",
     });
   }
 
   try {
     const payload = await readJsonBody(req);
-    console.log(`[sync] Request payload:`, { 
-      docId: payload.docId, 
-      tableIdOrName: payload.tableIdOrName,
-      rowId: payload.rowId,
-      collectionName: payload.collectionName,
-      slugFieldId: payload.slugFieldId,
-      rowLimit: payload.rowLimit,
-      publish: payload.publish,
-      deleteMissing: payload.deleteMissing,
-      action: payload.action,
-    });
 
-    // Handle publish action
     if (payload.action === "publish") {
       if (!payload.framerProjectUrl) {
         return sendJson(res, 400, {
@@ -145,382 +1184,90 @@ export default async function handler(req, res) {
         });
       }
 
-      console.log(`[publish] Publishing project: ${payload.framerProjectUrl}`);
       const publishResult = await publishProject(
         payload.framerProjectUrl,
         framerApiKey,
       );
-      console.log(`[publish] Result:`, publishResult);
 
       return sendJson(res, 200, publishResult);
     }
 
-    // Handle sync action (default)
-    const required = [
-      "docId",
-      "tableIdOrName",
-      "framerProjectUrl",
-      "collectionName",
-      "slugFieldId",
-    ];
+    const validationError = validateSyncPayload(payload);
+    if (validationError) {
+      return sendJson(res, 400, {
+        error: "INVALID_REQUEST",
+        message: validationError,
+      });
+    }
 
-    for (const field of required) {
-      if (!payload[field]) {
-        return sendJson(res, 400, {
-          error: "INVALID_REQUEST",
-          message: `Missing required field: ${field}`,
+    const idempotencyKey = payload.idempotencyKey || "";
+    if (idempotencyKey) {
+      const existing = findActiveJobByIdempotency(idempotencyKey);
+      if (existing) {
+        log("info", "request_deduped", {
+          idempotencyKey,
+          existingJobId: existing.jobId,
+          requestId: existing.requestId,
+          status: existing.status,
+          vercelTrace,
+        });
+        return sendJson(res, 202, {
+          accepted: true,
+          deduped: true,
+          jobId: existing.jobId,
+          requestId: existing.requestId,
+          status: existing.status,
+          message: `Request already accepted (jobId: ${existing.jobId}).`,
         });
       }
     }
 
-    const codaApiToken = process.env.CODA_API_TOKEN;
-    if (!codaApiToken) {
-      return sendJson(res, 500, {
-        error: "SERVER_ERROR",
-        message: "CODA_API_TOKEN is not configured",
-      });
-    }
+    const requestId = payload.requestId || randomUUID();
+    const jobId = randomUUID();
+    const payloadWithCallbackRow = await provisionCallbackRowIfNeeded(payload, {
+      requestId,
+      jobId,
+      vercelTrace,
+    });
+    createJob({
+      jobId,
+      requestId,
+      idempotencyKey,
+      payload: payloadWithCallbackRow,
+    });
 
-    const framerApiKey = process.env.FRAMER_API_KEY || payload.framerApiKey;
-    if (!framerApiKey) {
-      return sendJson(res, 400, {
-        error: "INVALID_REQUEST",
-        message: "Missing Framer API key",
-      });
-    }
+    log("info", "request_accepted", {
+      requestId,
+      jobId,
+      idempotencyKey,
+      action: payloadWithCallbackRow.action || "sync",
+      docId: payloadWithCallbackRow.docId,
+      tableIdOrName: payloadWithCallbackRow.tableIdOrName,
+      rowId: payloadWithCallbackRow.rowId || "",
+      publish: Boolean(payloadWithCallbackRow.publish),
+      vercelTrace,
+    });
 
-    const isRowSync = payload.action === "rowSync" || Boolean(payload.rowId);
-    if (isRowSync && !payload.rowId) {
-      return sendJson(res, 400, {
-        error: "INVALID_REQUEST",
-        message: "Missing required field for rowSync: rowId",
-      });
-    }
+    scheduleJobProcessing({
+      req,
+      res,
+      jobId,
+      requestId,
+    });
 
-    // Resolve slugFieldId (accepts both column name and ID)
-    let resolvedSlugFieldId = payload.slugFieldId;
-    if (payload.slugFieldId) {
-      resolvedSlugFieldId = await resolveColumnNameOrId(
-        payload.docId,
-        payload.tableIdOrName,
-        payload.slugFieldId,
-        codaApiToken,
-      );
-      if (resolvedSlugFieldId !== payload.slugFieldId) {
-        console.log(`[sync] Resolved slug field: "${payload.slugFieldId}" -> ${resolvedSlugFieldId}`);
-      }
-    }
-
-    const getCodaSnapshot = async () => {
-      let tableData;
-      if (isRowSync) {
-        if (isApiRowId(payload.rowId)) {
-          try {
-            tableData = await getCodaRowData(
-              payload.docId,
-              payload.tableIdOrName,
-              payload.rowId,
-              codaApiToken,
-            );
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            console.warn(`[sync] Direct API row lookup failed (${message}). Falling back to selector lookup.`);
-          }
-        }
-
-        if (!tableData) {
-          const selectorData = await getCodaTableData(
-            payload.docId,
-            payload.tableIdOrName,
-            codaApiToken,
-            payload.rowLimit || 500,
-          );
-          const matchedRow = findRowBySelector(selectorData, payload.rowId, resolvedSlugFieldId);
-          if (!matchedRow) {
-            const normalizedSelector = normalizeSelectorValue(payload.rowId);
-            throw new Error(
-              `Row not found for selector "${normalizedSelector}". Pass API row ID (i-...) or unique slug value from the slug field.`,
-            );
-          }
-          tableData = {
-            columns: selectorData.columns,
-            rows: [matchedRow],
-          };
-        }
-      } else {
-        tableData = await getCodaTableData(
-          payload.docId,
-          payload.tableIdOrName,
-          codaApiToken,
-          payload.rowLimit || 100,
-        );
-      }
-
-      console.log(`[sync] Coda data:`, {
-        columnsCount: tableData.columns.length,
-        rowsCount: tableData.rows.length,
-        slugFieldId: resolvedSlugFieldId,
-        columnIds: tableData.columns.map(c => c.id),
-        firstRowValues: tableData.rows[0]?.values,
-      });
-
-      const columns = normalizeColumns(tableData.columns);
-      const rows = normalizeRows(tableData.rows);
-
-      console.log(`[sync] Fetched ${rows.length} rows, ${columns.length} columns from Coda (${isRowSync ? "rowSync" : "tableSync"})`);
-
-      const mappingResult = buildFieldsAndItems({
-        columns,
-        rows,
-        slugFieldId: resolvedSlugFieldId,
-        use12HourTime: payload.use12HourTime !== false, // Default to true (12-hour format)
-      });
-
-      console.log(`[sync] Mapping result: ${mappingResult.items.length} items, ${mappingResult.skippedCount} skipped, ${mappingResult.warnings.length} warnings`);
-      if (mappingResult.warnings.length > 0) {
-        console.log(`[sync] Warnings:`, mappingResult.warnings);
-      }
-
-      return mappingResult;
-    };
-
-    const maxCodaStateRetries = parseIntEnv(
-      process.env.CODA_STATE_RETRY_ATTEMPTS || 3,
-      3,
-      1,
-      6,
-    );
-    const codaStateRetryDelayMs = parseIntEnv(
-      process.env.CODA_STATE_RETRY_DELAY_MS || 1200,
-      1200,
-      0,
-      10000,
-    );
-
-    let mappingResult;
-    for (let attempt = 1; attempt <= maxCodaStateRetries; attempt += 1) {
-      mappingResult = await getCodaSnapshot();
-
-      const retryableWarning = shouldRetryForTransientCodaWarnings(mappingResult.warnings);
-      if (!retryableWarning || attempt === maxCodaStateRetries) {
-        break;
-      }
-
-      const delayMs = codaStateRetryDelayMs * attempt;
-      console.warn(
-        `[sync] Transient Coda warning detected (attempt ${attempt}/${maxCodaStateRetries}): retrying Coda snapshot in ${delayMs}ms`,
-      );
-      await sleep(delayMs);
-    }
-
-    const collection = await getOrCreateManagedCollection(
-      payload.framerProjectUrl,
-      framerApiKey,
-      payload.collectionName,
-    );
-
-    console.log(`[sync] Collection: ${collection.collectionId} (${collection.collectionName})${collection.created ? " [NEW]" : ""}`);
-
-    let fieldsSet = 0;
-    if (!isRowSync || collection.created) {
-      fieldsSet = await setCollectionFields(
-        payload.framerProjectUrl,
-        framerApiKey,
-        collection.collectionId,
-        mappingResult.fields,
-      );
-      console.log(`[sync] Set ${fieldsSet} fields`);
-    } else {
-      console.log(`[sync] Skipping field sync in rowSync for existing collection`);
-    }
-
-    if (mappingResult.items.length > 0) {
-      let itemsToAdd = mappingResult.items;
-      let existingItemIds = [];
-
-      try {
-        existingItemIds = await getManagedCollectionItemIds(
-          payload.framerProjectUrl,
-          framerApiKey,
-          collection.collectionId,
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[sync] Could not fetch existing item ids before add: ${message}`);
-      }
-
-      const codaFieldIdToName = new Map(
-        mappingResult.fields.map((field) => [field.id, field.name]),
-      );
-      const collectionFields = await getCollectionFields(
-        payload.framerProjectUrl,
-        framerApiKey,
-        collection.collectionId,
-      );
-      const collectionFieldNameToId = new Map(
-        collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
-      );
-
-      itemsToAdd = mappingResult.items.map((item) => {
-        const remappedFieldData = {};
-        const originalFieldData = item?.fieldData || {};
-
-        for (const [sourceFieldId, fieldValue] of Object.entries(originalFieldData)) {
-          const sourceFieldName = codaFieldIdToName.get(sourceFieldId);
-          if (!sourceFieldName) continue;
-          const targetFieldId = collectionFieldNameToId.get(String(sourceFieldName).toLowerCase());
-          if (!targetFieldId) continue;
-          remappedFieldData[targetFieldId] = fieldValue;
-        }
-
-        return {
-          ...item,
-          fieldData: remappedFieldData,
-        };
-      });
-
-      const originalCount = Object.keys(mappingResult.items[0]?.fieldData || {}).length;
-      const remappedCount = Object.keys(itemsToAdd[0]?.fieldData || {}).length;
-      if (remappedCount < originalCount) {
-        console.log(
-          `[sync] Remapped item fields by name: removed ${originalCount - remappedCount} unmapped key(s)`,
-        );
-      }
-
-      if (isRowSync && !collection.created) {
-        const allowedFieldIds = new Set(
-          await getCollectionFieldIds(
-            payload.framerProjectUrl,
-            framerApiKey,
-            collection.collectionId,
-          ),
-        );
-
-        itemsToAdd = mappingResult.items.map((item) => {
-          const filteredFieldData = {};
-          const originalFieldData = item?.fieldData || {};
-          for (const [fieldId, fieldValue] of Object.entries(originalFieldData)) {
-            if (allowedFieldIds.has(fieldId)) {
-              filteredFieldData[fieldId] = fieldValue;
-            }
-          }
-          return {
-            ...item,
-            fieldData: filteredFieldData,
-          };
-        });
-
-        const filteredCount = Object.keys(itemsToAdd[0]?.fieldData || {}).length;
-        if (filteredCount < originalCount) {
-          console.log(
-            `[sync] RowSync pre-filtered unknown fields: removed ${originalCount - filteredCount} key(s) before addItems`,
-          );
-        }
-      }
-
-      console.log(`[sync] Adding ${mappingResult.items.length} items to collection...`);
-      await addItemsToCollection(
-        payload.framerProjectUrl,
-        framerApiKey,
-        collection.collectionId,
-        itemsToAdd,
-      );
-      console.log(`[sync] Items added successfully`);
-
-      try {
-        const afterItemIds = await getManagedCollectionItemIds(
-          payload.framerProjectUrl,
-          framerApiKey,
-          collection.collectionId,
-        );
-        const beforeSet = new Set(existingItemIds);
-        const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
-        const expectedNewIds = Array.from(submittedIds).filter((id) => !beforeSet.has(id));
-        const afterSet = new Set(afterItemIds);
-        const missingNewIds = expectedNewIds.filter((id) => !afterSet.has(id));
-
-        if (missingNewIds.length > 0) {
-          const warning = `Submitted ${itemsToAdd.length} items, but ${missingNewIds.length} expected new id(s) were not present after add: ${missingNewIds.join(", ")}`;
-          mappingResult.warnings.push(warning);
-          console.warn(`[sync] ${warning}`);
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[sync] Could not verify item ids after add: ${message}`);
-      }
-    } else {
-      console.log(`[sync] No items to add`);
-    }
-
-    let itemsRemoved = 0;
-    if (!isRowSync && payload.deleteMissing) {
-      const codaItemIds = new Set(mappingResult.items.map((item) => String(item.id)));
-      const managedItemIds = await getManagedCollectionItemIds(
-        payload.framerProjectUrl,
-        framerApiKey,
-        collection.collectionId,
-      );
-      const toRemove = managedItemIds.filter((id) => !codaItemIds.has(String(id)));
-
-      if (toRemove.length > 0) {
-        console.log(`[sync] Removing ${toRemove.length} item(s) not present in Coda table snapshot...`);
-        itemsRemoved = await removeItemsFromManagedCollection(
-          payload.framerProjectUrl,
-          framerApiKey,
-          collection.collectionId,
-          toRemove,
-        );
-        console.log(`[sync] Removed ${itemsRemoved} stale item(s)`);
-      } else {
-        console.log(`[sync] deleteMissing enabled: no stale items to remove`);
-      }
-    }
-
-    let publishResult = null;
-    if (payload.publish) {
-      console.log(`[sync] Publishing project after sync...`);
-      publishResult = await publishProject(
-        payload.framerProjectUrl,
-        framerApiKey,
-      );
-      console.log(`[sync] Publish result:`, publishResult);
-    } else {
-      console.log(`[sync] Publish parameter not set (payload.publish=${payload.publish})`);
-    }
-
-    const responseBody = {
-      success: true,
-      collectionId: collection.collectionId,
-      collectionName: collection.collectionName,
-      itemsAdded: mappingResult.items.length,
-      itemsRemoved,
-      fieldsSet,
-      warnings: mappingResult.warnings,
-      published: publishResult?.published ?? false,
-      deploymentId: publishResult?.deploymentId ?? "",
-      message: publishResult?.published 
-        ? `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""} to "${collection.collectionName}" and published (deployment: ${publishResult.deploymentId}).`
-        : `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""} to "${collection.collectionName}".`,
-    };
-    console.log(`[sync] Final response:`, responseBody);
-    return sendJson(res, 200, responseBody);
+    return sendJson(res, 202, {
+      accepted: true,
+      jobId,
+      requestId,
+      status: "queued",
+      message: `Request accepted. Processing started (jobId: ${jobId}).`,
+      statusUrl: `/api/sync?jobId=${jobId}`,
+    });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error(`[sync] Error:`, errorMsg, error);
-    
-    // Return error in response body so it shows in the Response column
-    const errorResponse = {
-      success: false,
-      collectionId: "",
-      collectionName: "",
-      itemsAdded: 0,
-      itemsRemoved: 0,
-      fieldsSet: 0,
-      warnings: [],
-      published: false,
-      deploymentId: "",
-      message: `❌ Sync failed: ${errorMsg}`,
-    };
-    return sendJson(res, 200, errorResponse);
+    return sendJson(res, 500, {
+      error: "SERVER_ERROR",
+      message: errorMsg,
+    });
   }
 }
