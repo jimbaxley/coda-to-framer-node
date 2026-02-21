@@ -985,6 +985,8 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
             eventLogger("warn", "callback", "Skipping recreate of callback row because rowWasCreatedHere is true");
           }
         }
+      } catch (rowErr) {
+        lastRowUpdateError = rowErr;
       }
     }
 
