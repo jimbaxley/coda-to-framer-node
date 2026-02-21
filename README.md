@@ -145,3 +145,11 @@ automatically enqueues a lightweight follow-up job to try the write again after
 a short delay (5 s). This retry mechanism will repeat up to
 `CODA_CALLBACK_RETRY_JOB_MAX` times (default 3) before giving up. Use the
 variable to adjust your tolerance for throttling.
+
+### One‑shot writes
+
+When the callback row does not yet exist, the handler creates it with the full
+set of status cells; no additional `PUT` requests are made afterward. This
+prevents a burst of rapid write operations (create + multiple updates) which
+was the primary cause of 429 errors in high‑load scenarios. Only subsequent
+runs that resolve to an existing row will issue update calls.

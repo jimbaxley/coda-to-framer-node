@@ -866,41 +866,45 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       }
     }
 
-    // If we just created the full row above, skip the single-cell update —
-    // creation already populated the status/message. Otherwise, attempt the
-    // faster single-cell update and tolerate a missing row until the main
-    // row-update routine runs below.
-    if (!rowWasCreatedHere) {
-      try {
-        await updateTableCell(
+    // If we just created the full row above, we can stop here. the
+    // creation payload already contained every cell we care about, and
+    // issuing additional updates immediately afterwards is what was blowing
+    // Coda’s rate limit when a row is autocreated during a sync.
+    if (rowWasCreatedHere) {
+      eventLogger("info", "callback", "Callback row just created; skipping follow-on updates");
+      return;
+    }
+
+    // Otherwise, attempt a single-cell update for speed, and if that
+    // succeeds we’ll still run through the more robust row-update loop
+    // below to set everything. we still handle missing-row gracefully.
+    try {
+      await updateTableCell(
+        statusDocId,
+        resolvedStatusTableId,
+        resolvedStatusRowId,
+        resolvedStatusColumnId,
+        message,
+        codaApiToken,
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isNotFound = (err && err.status === 404) || /404\s+Not\s+Found/i.test(errMsg) || /row not found/i.test(errMsg.toLowerCase());
+      if (isNotFound) {
+        // Row missing — log and continue; the robust row-update below will
+        // either populate or recreate the final log row as necessary.
+        eventLogger("info", "callback", "Callback row missing before single-cell update", {
           statusDocId,
-          resolvedStatusTableId,
+          statusTableIdOrName: resolvedStatusTableId,
+          statusRowSelector,
           resolvedStatusRowId,
+          statusColumnNameOrId,
           resolvedStatusColumnId,
-          message,
-          codaApiToken,
-        );
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        const isNotFound = (err && err.status === 404) || /404\s+Not\s+Found/i.test(errMsg) || /row not found/i.test(errMsg.toLowerCase());
-        if (isNotFound) {
-          // Row missing — log and continue; the robust row-update below will
-          // either populate or recreate the final log row as necessary.
-          eventLogger("info", "callback", "Callback row missing before single-cell update", {
-            statusDocId,
-            statusTableIdOrName: resolvedStatusTableId,
-            statusRowSelector,
-            resolvedStatusRowId,
-            statusColumnNameOrId,
-            resolvedStatusColumnId,
-            error: errMsg,
-          });
-        } else {
-          throw err;
-        }
+          error: errMsg,
+        });
+      } else {
+        throw err;
       }
-    } else {
-      eventLogger("info", "callback", "Skipping single-cell update since rowWasCreatedHere is true");
     }
 
     // Attempt to update the row cells. Retry transient 404s that
@@ -916,19 +920,6 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
           cellsToUpdate,
           codaApiToken,
         );
-
-        eventLogger("info", "callback", "Updated Coda status cell", {
-          statusDocId,
-          statusTableIdOrName: resolvedStatusTableId,
-          statusRowSelector,
-          resolvedStatusRowId,
-          statusColumnNameOrId,
-          resolvedStatusColumnId,
-          attempt,
-        });
-        lastRowUpdateError = null;
-        break;
-      } catch (rowErr) {
         lastRowUpdateError = rowErr;
         const msg = rowErr instanceof Error ? rowErr.message : String(rowErr);
         const isNotFound = (rowErr && rowErr.status === 404) || /404\s+Not\s+Found/i.test(msg) || /row not found/i.test(msg.toLowerCase());
