@@ -30,6 +30,7 @@ import {
   sleep,
   parseIntEnv,
   shouldRetryForTransientCodaWarnings,
+  isRetryableCodaError,
 } from "../lib/retry-policy.js";
 import {
   createJob,
@@ -894,22 +895,26 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
         lastRowUpdateError = rowErr;
         const msg = rowErr instanceof Error ? rowErr.message : String(rowErr);
         const isNotFound = (rowErr && rowErr.status === 404) || /404\s+Not\s+Found/i.test(msg) || /row not found/i.test(msg.toLowerCase());
+        const retryable = isNotFound || isRetryableCodaError(rowErr);
+
         eventLogger("warn", "callback", "Transient row-update failure", {
           statusDocId,
           resolvedStatusRowId,
           attempt,
           error: msg,
+          retryable,
         });
-        if (!isNotFound) {
-          // Non-404 failures should not be retried here
+
+        if (!retryable) {
+          // this error is not one we think will resolve if retried
           break;
         }
-        // For 404, wait a short backoff and retry
+
+        // back off before trying again
         await sleep(150 * attempt);
 
-        // If this was the last attempt, try recreating the row with the full
-        // set of cells to ensure data is persisted, then retry the update once.
-        if (attempt === maxRowUpdateAttempts) {
+        // If this was the last attempt, attempt special recovery for 404
+        if (attempt === maxRowUpdateAttempts && isNotFound) {
           if (!rowWasCreatedHere) {
             try {
               const created = await createTableRow(
@@ -949,8 +954,6 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
               lastRowUpdateError = createErr;
             }
           } else {
-            // Row was created by this function earlier; do not create a duplicate.
-            // Let the retry loop finish and surface the update failure instead.
             eventLogger("warn", "callback", "Skipping recreate of callback row because rowWasCreatedHere is true");
           }
         }
@@ -958,6 +961,9 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     }
 
     if (lastRowUpdateError) {
+      // if the final error is retryable (e.g. rate limit) we already logged a
+      // transient failure above. the caller will swallow the exception, but we
+      // surface the fact so that the job event contains the detail.
       throw lastRowUpdateError instanceof Error ? lastRowUpdateError : new Error(String(lastRowUpdateError));
     }
   } catch (error) {
@@ -969,6 +975,15 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       statusRowSelector,
       statusColumnNameOrId,
     });
+
+    // If the failure looks like a transient/rate‑limit issue, note that in
+    // the logs so that operators know the status row might still be updated
+    // if they re-run the job manually.
+    if (isRetryableCodaError(error)) {
+      eventLogger("info", "callback", "Callback failure is retryable; downstream row may be updated later", {
+        callbackError,
+      });
+    }
   }
 }
 
