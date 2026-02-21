@@ -86,7 +86,8 @@ function getWaitUntil(req, res) {
 function scheduleJobProcessing({ req, res, jobId, requestId }) {
   const run = async () => {
     try {
-      await processJob(jobId);
+      // pass req/res along so later code can re-schedule work via waitUntil
+      await processJob(jobId, { req, res });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       appendJobEvent(jobId, {
@@ -631,7 +632,43 @@ function buildCallbackLogValues(job, message) {
   };
 }
 
-async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = null) {
+
+// When a status-cell update fails with a transient error, we spin up a
+// secondary job to retry the callback at a later time. This keeps the main
+// sync job from being marked as failed while still pushing the status row
+// eventually.
+function scheduleCallbackRetry(originalPayload, message, retryCount, eventLogger, context) {
+  const newPayload = {
+    action: "callback",
+    callback: originalPayload.callback || {},
+    docId: originalPayload.docId,
+    tableIdOrName: originalPayload.tableIdOrName,
+    callbackRetryCount: retryCount,
+    retryMessage: message,
+  };
+
+  const requestId = originalPayload.requestId || "";
+  const jobId = randomUUID();
+  createJob({ jobId, requestId, idempotencyKey: "", payload: newPayload });
+  eventLogger("info", "callback_retry_scheduled", "Scheduled follow-up callback job", {
+    jobId,
+    retryCount,
+  });
+
+  const run = async () => {
+    // give Coda a little breathing room before retrying (typically 5s)
+    await sleep(5000);
+    await processJob(jobId, context);
+  };
+  if (context && typeof context.waitUntil === "function") {
+    context.waitUntil(run());
+  } else {
+    // best effort; the original invocation may die but this gives it a chance
+    setTimeout(run, 1000 * 10);
+  }
+}
+
+async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = null, context = {}) {
   const callback = payload.callback || {};
   const hasExplicitCallbackTable = Object.prototype.hasOwnProperty.call(callback, "statusTableIdOrName")
     || Object.prototype.hasOwnProperty.call(callback, "statusTableInput");
@@ -976,18 +1013,25 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       statusColumnNameOrId,
     });
 
-    // If the failure looks like a transient/rate‑limit issue, note that in
-    // the logs so that operators know the status row might still be updated
-    // if they re-run the job manually.
-    if (isRetryableCodaError(error)) {
-      eventLogger("info", "callback", "Callback failure is retryable; downstream row may be updated later", {
+    const retryable = isRetryableCodaError(error);
+    if (retryable) {
+      eventLogger("info", "callback", "Callback failure is retryable; scheduling follow-up job", {
         callbackError,
       });
+      // schedule a lightweight job to try again later, but only up to a
+      // configurable limit so we don’t loop forever.
+      const existingCount = payload.callbackRetryCount || 0;
+      const maxRetries = parseIntEnv(process.env.CODA_CALLBACK_RETRY_JOB_MAX || 3, 3, 1, 20);
+      if (existingCount < maxRetries) {
+        scheduleCallbackRetry(payload, message, existingCount + 1, eventLogger, context);
+      } else {
+        eventLogger("warn", "callback", "Exceeded max callback retry jobs", { existingCount, maxRetries });
+      }
     }
   }
 }
 
-async function processJob(jobId) {
+async function processJob(jobId, context = {}) {
   const job = getJob(jobId);
   if (!job) {
     return;
@@ -1032,6 +1076,34 @@ async function processJob(jobId) {
     updateJob(jobId, { status: "running" });
   }
 
+  // handle special 'callback' only jobs that may have been scheduled
+  // when an earlier run failed to update the status row due to a throttling
+  // spike.
+  if (job.payload.action === "callback") {
+    eventLogger("info", "callback_job", "Processing standalone callback job");
+    const retryMsg = job.payload.retryMessage || "";
+    try {
+      await writeStatusCallback(job.payload, retryMsg, eventLogger, job, context);
+      updateJob(jobId, {
+        status: "succeeded",
+        completedAt: new Date().toISOString(),
+        result: { success: true, message: retryMsg },
+        error: null,
+      });
+      eventLogger("info", "completed", "Callback job succeeded", {});
+    } catch (cbErr) {
+      const errMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+      updateJob(jobId, {
+        status: "failed",
+        completedAt: new Date().toISOString(),
+        result: makeFailureResponse(errMsg),
+        error: errMsg,
+      });
+      eventLogger("error", "failed", "Callback job failed", { error: errMsg });
+    }
+    return;
+  }
+
   try {
     const result = await executeSyncWorkflow(job.payload, eventLogger);
     updateJob(jobId, {
@@ -1047,7 +1119,7 @@ async function processJob(jobId) {
       itemsRemoved: result.itemsRemoved,
     });
     const completedJob = getJobWithEvents(jobId) || getJob(jobId);
-    await writeStatusCallback(job.payload, result.message, eventLogger, completedJob);
+    await writeStatusCallback(job.payload, result.message, eventLogger, completedJob, context);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const failure = makeFailureResponse(errorMessage);
@@ -1061,7 +1133,7 @@ async function processJob(jobId) {
       error: errorMessage,
     });
     const failedJob = getJobWithEvents(jobId) || getJob(jobId);
-    await writeStatusCallback(job.payload, failure.message, eventLogger, failedJob);
+    await writeStatusCallback(job.payload, failure.message, eventLogger, failedJob, context);
   }
 }
 

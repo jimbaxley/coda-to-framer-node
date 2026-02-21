@@ -137,3 +137,11 @@ For most maker setups, send friendly callback values (no ID hunting required):
 
 - Background processing now prefers `waitUntil` when available and falls back to `setTimeout`.
 - Job tracking is still in-memory, so use callback writes to Coda as the primary source of truth for maker-visible status.
+
+### Callback retry jobs
+
+If a callback update fails because Coda is rate‑limited, the backend
+automatically enqueues a lightweight follow-up job to try the write again after
+a short delay (5 s). This retry mechanism will repeat up to
+`CODA_CALLBACK_RETRY_JOB_MAX` times (default 3) before giving up. Use the
+variable to adjust your tolerance for throttling.
