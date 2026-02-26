@@ -2,12 +2,20 @@ import { listCollections } from "../lib/framer-client.js";
 import { sendJson } from "./sync.js"; // reuse helper
 
 export default async function handler(req, res) {
+  // Require API key for authentication
+  const API_SECRET_KEY = process.env.API_SECRET_KEY;
+
   const requestUrl = new URL(req.url || "/api/collections", "http://localhost");
   if (req.method !== "GET") {
     res.statusCode = 405;
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify({ error: "METHOD_NOT_ALLOWED", message: "Use GET /api/collections" }));
     return;
+  }
+  // Check API key in header
+  const clientKey = req.headers["x-api-key"];
+  if (!API_SECRET_KEY || clientKey !== API_SECRET_KEY) {
+    return res.status(401).json({ error: "UNAUTHORIZED", message: "Missing or invalid API key." });
   }
 
   const projectUrl =

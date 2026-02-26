@@ -24,6 +24,26 @@ Optional retry/fallback tuning:
 - `FRAMER_ADD_PER_ITEM_TIMEOUT_MS` - timeout for final per-item fallback adds (default: min(operation timeout, `8000`))
 - `CODA_INITIAL_DELAY_MS` - initial delay before extraction to allow recent Coda UI edits to become API-visible (default: `1200`)
 
+## Securing the API Endpoint
+
+To prevent unauthorized access, the backend requires an API key for all requests.
+
+1. **Generate a secure API key** (e.g., using a password manager or `openssl rand -hex 32`).
+2. **Set the key in Vercel** as an environment variable named `API_SECRET_KEY`.
+3. **Send the key in requests** as an HTTP header:
+   - Header name: `x-api-key`
+   - Header value: your secret key
+
+If the key is missing or incorrect, the API will return a 401 Unauthorized error.
+
+**Example (using curl):**
+
+```
+curl -H "x-api-key: YOUR_SECRET_KEY" "https://your-vercel-app.vercel.app/api/collections?projectUrl=..."
+```
+
+**Never share your API key publicly.**
+
 ## Endpoint
 
 POST `/api/sync`
@@ -153,3 +173,19 @@ set of status cells; no additional `PUT` requests are made afterward. This
 prevents a burst of rapid write operations (create + multiple updates) which
 was the primary cause of 429 errors in high‑load scenarios. Only subsequent
 runs that resolve to an existing row will issue update calls.
+
+### API Key Requirements
+
+- The API key must be a secure, random string. For best security, use at least 32 characters (hex or base64 recommended).
+- Example (generate with `openssl rand -hex 32`):
+  
+  `b7e3c2f4a1d9e8c7b6a5f4e3d2c1b0a9876543210fedcba9876543210abcdef12`
+- The key is case-sensitive and must match exactly between your Vercel environment (`API_SECRET_KEY`) and the value you enter when connecting the Coda pack.
+- Do not use simple or guessable values (e.g., "password", "123456").
+- Store the key securely and never share it publicly.
+
+**Parameter summary:**
+- Name in Vercel: `API_SECRET_KEY`
+- Header in requests: `x-api-key`
+- Minimum recommended length: 32 characters
+- Allowed characters: Any (hex or base64 recommended)
