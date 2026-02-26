@@ -444,6 +444,34 @@ async function executeSyncWorkflow(payload, eventLogger) {
     payload.collectionName,
   );
 
+
+  // If collection was just created but not found, poll for existence before proceeding
+  if (collection.created && collection.foundAfterCreate === false) {
+    const pollAttempts = 5;
+    const pollDelayMs = 1000;
+    let found = false;
+    for (let i = 0; i < pollAttempts; i++) {
+      try {
+        const collections = await getCollectionFields(
+          payload.framerProjectUrl,
+          framerApiKey,
+          collection.collectionId,
+        );
+        if (collections && collections.length > 0) {
+          found = true;
+          break;
+        }
+      } catch (err) {
+        // ignore, will retry
+      }
+      await sleep(pollDelayMs);
+    }
+    if (!found) {
+      eventLogger("error", "framer_sync", "Collection not found after polling", { collectionName: collection.collectionName });
+      throw new Error(`Managed collection not found after creation and polling: ${collection.collectionName}`);
+    }
+  }
+
   let fieldsSet = 0;
   if (!isRowSync || collection.created) {
     fieldsSet = await setCollectionFields(
