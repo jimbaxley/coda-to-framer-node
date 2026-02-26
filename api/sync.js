@@ -455,6 +455,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
   }
 
   if (mappingResult.items.length > 0) {
+
     let itemsToAdd = mappingResult.items;
     let existingItemIds = [];
 
@@ -474,32 +475,77 @@ async function executeSyncWorkflow(payload, eventLogger) {
     const codaFieldIdToName = new Map(
       mappingResult.fields.map((field) => [field.id, field.name]),
     );
-    const collectionFields = await getCollectionFields(
+    let collectionFields = await getCollectionFields(
       payload.framerProjectUrl,
       framerApiKey,
       collection.collectionId,
     );
-    const collectionFieldNameToId = new Map(
+    let collectionFieldNameToId = new Map(
       collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
     );
 
-    itemsToAdd = mappingResult.items.map((item) => {
-      const remappedFieldData = {};
-      const originalFieldData = item?.fieldData || {};
+    function remapItems(items) {
+      return items.map((item) => {
+        const remappedFieldData = {};
+        const originalFieldData = item?.fieldData || {};
+        for (const [sourceFieldId, fieldValue] of Object.entries(originalFieldData)) {
+          const sourceFieldName = codaFieldIdToName.get(sourceFieldId);
+          if (!sourceFieldName) continue;
+          const targetFieldId = collectionFieldNameToId.get(String(sourceFieldName).toLowerCase());
+          if (!targetFieldId) continue;
+          remappedFieldData[targetFieldId] = fieldValue;
+        }
+        return {
+          ...item,
+          fieldData: remappedFieldData,
+        };
+      });
+    }
 
-      for (const [sourceFieldId, fieldValue] of Object.entries(originalFieldData)) {
-        const sourceFieldName = codaFieldIdToName.get(sourceFieldId);
-        if (!sourceFieldName) continue;
-        const targetFieldId = collectionFieldNameToId.get(String(sourceFieldName).toLowerCase());
-        if (!targetFieldId) continue;
-        remappedFieldData[targetFieldId] = fieldValue;
+    itemsToAdd = remapItems(mappingResult.items);
+
+    // Retry logic for first sync/collection creation
+    let addItemsAttempted = false;
+    let addItemsError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await addItemsToCollection(
+          payload.framerProjectUrl,
+          framerApiKey,
+          collection.collectionId,
+          itemsToAdd,
+        );
+        addItemsAttempted = true;
+        break;
+      } catch (err) {
+        addItemsError = err;
+        const msg = String(err && err.message ? err.message : err);
+        if (
+          attempt === 0 &&
+          collection.created &&
+          /field not found/i.test(msg)
+        ) {
+          eventLogger("warning", "framer_sync", "Retrying addItems after collection creation and schema refresh", { msg });
+          // Wait briefly and re-fetch schema, then retry
+          await sleep(1500);
+          collectionFields = await getCollectionFields(
+            payload.framerProjectUrl,
+            framerApiKey,
+            collection.collectionId,
+          );
+          collectionFieldNameToId = new Map(
+            collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
+          );
+          itemsToAdd = remapItems(mappingResult.items);
+          continue;
+        } else {
+          throw err;
+        }
       }
-
-      return {
-        ...item,
-        fieldData: remappedFieldData,
-      };
-    });
+    }
+    if (!addItemsAttempted && addItemsError) {
+      throw addItemsError;
+    }
 
     if (isRowSync && !collection.created) {
       const allowedFieldIds = new Set(
