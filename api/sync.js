@@ -214,6 +214,8 @@ async function readJsonBody(req) {
 function makeFailureResponse(errorMessage) {
   return {
     success: false,
+    syncSuccess: false,
+    publishRequested: false,
     collectionId: "",
     collectionName: "",
     itemsAdded: 0,
@@ -221,6 +223,7 @@ function makeFailureResponse(errorMessage) {
     fieldsSet: 0,
     warnings: [],
     published: false,
+    publishError: "",
     deploymentId: "",
     message: `❌ Sync failed: ${errorMessage}`,
   };
@@ -652,27 +655,46 @@ async function executeSyncWorkflow(payload, eventLogger) {
   }
 
   let publishResult = null;
+  let publishError = "";
+  const publishRequested = Boolean(payload.publish);
   if (payload.publish) {
     eventLogger("info", "publishing", "Publishing project");
-    publishResult = await publishProject(
-      payload.framerProjectUrl,
-      framerApiKey,
-    );
+    try {
+      publishResult = await publishProject(
+        payload.framerProjectUrl,
+        framerApiKey,
+      );
+    } catch (error) {
+      publishError = error instanceof Error ? error.message : String(error);
+      eventLogger("warning", "publishing", "Publish failed after successful sync", {
+        error: publishError,
+      });
+    }
   }
 
+  const publishSucceeded = Boolean(publishResult?.published);
+  const overallSuccess = !publishRequested || publishSucceeded;
+  const itemSummary = `${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""}`;
+  const baseSyncMessage = `Synced ${itemSummary} to "${collection.collectionName}"`;
+
   const responseBody = {
-    success: true,
+    success: overallSuccess,
+    syncSuccess: true,
+    publishRequested,
     collectionId: collection.collectionId,
     collectionName: collection.collectionName,
     itemsAdded: mappingResult.items.length,
     itemsRemoved,
     fieldsSet,
     warnings: mappingResult.warnings,
-    published: publishResult?.published ?? false,
+    published: publishSucceeded,
+    publishError,
     deploymentId: publishResult?.deploymentId ?? "",
-    message: publishResult?.published
-      ? `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""} to "${collection.collectionName}" and published (deployment: ${publishResult.deploymentId}).`
-      : `✅ Synced ${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""} to "${collection.collectionName}".`,
+    message: publishSucceeded
+      ? `✅ ${baseSyncMessage} and published (deployment: ${publishResult.deploymentId}).`
+      : publishRequested
+        ? `⚠️ ${baseSyncMessage}, but publish failed: ${publishError}`
+        : `✅ ${baseSyncMessage}.`,
   };
 
   return responseBody;
@@ -1173,17 +1195,21 @@ async function processJob(jobId, context = {}) {
 
   try {
     const result = await executeSyncWorkflow(job.payload, eventLogger);
+    const isPartialFailure = Boolean(result.syncSuccess && result.publishRequested && !result.published);
     updateJob(jobId, {
-      status: result.published ? "published" : "succeeded",
+      status: result.published ? "published" : (isPartialFailure ? "partial_failed" : "succeeded"),
       completedAt: new Date().toISOString(),
       result,
-      error: null,
+      error: result.publishError || null,
     });
     eventLogger("info", "completed", "Job completed", {
       success: result.success,
+      syncSuccess: result.syncSuccess,
+      partialFailure: isPartialFailure,
       published: result.published,
       itemsAdded: result.itemsAdded,
       itemsRemoved: result.itemsRemoved,
+      publishError: result.publishError || "",
     });
     const completedJob = getJobWithEvents(jobId) || getJob(jobId);
     await writeStatusCallback(job.payload, result.message, eventLogger, completedJob, context);
