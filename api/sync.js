@@ -600,14 +600,14 @@ async function executeSyncWorkflow(payload, eventLogger) {
           fieldData: filteredFieldData,
         };
       });
-    }
 
-    await addItemsToCollection(
-      payload.framerProjectUrl,
-      framerApiKey,
-      collection.collectionId,
-      itemsToAdd,
-    );
+      await addItemsToCollection(
+        payload.framerProjectUrl,
+        framerApiKey,
+        collection.collectionId,
+        itemsToAdd,
+      );
+    }
 
     try {
       const afterItemIds = await getManagedCollectionItemIds(
