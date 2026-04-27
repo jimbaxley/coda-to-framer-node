@@ -16,16 +16,28 @@ import {
   buildFieldsAndItems,
 } from "../lib/mapping.js";
 import {
-  getOrCreateManagedCollection,
-  getCollectionFields,
-  getCollectionFieldIds,
-  getManagedCollectionItemIds,
-  removeItemsFromManagedCollection,
-  setCollectionFields,
-  addItemsToCollection,
   publishProject,
   listCollections,
+  runSyncSession,
+  withTimeout,
+  formatFramerError,
+  getPublishTimeoutMs,
 } from "../lib/framer-client.js";
+
+function normalizeCollectionFieldsLocal(fields) {
+  return (Array.isArray(fields) ? fields : [])
+    .map((field) => {
+      if (!field || typeof field !== "object") return null;
+      const id = typeof field.id === "string" ? field.id : null;
+      const name =
+        typeof field.name === "string" ? field.name :
+        typeof field.label === "string" ? field.label :
+        typeof field.title === "string" ? field.title : null;
+      if (!id || !name) return null;
+      return { id, name };
+    })
+    .filter(Boolean);
+}
 import {
   sleep,
   parseIntEnv,
@@ -441,236 +453,246 @@ async function executeSyncWorkflow(payload, eventLogger) {
     collectionName: payload.collectionName,
   });
 
-  const collection = await getOrCreateManagedCollection(
-    payload.framerProjectUrl,
-    framerApiKey,
-    payload.collectionName,
-  );
-
-
-  // If collection was just created but not found, poll for existence before proceeding
-  if (collection.created && collection.foundAfterCreate === false) {
-    const pollAttempts = 5;
-    const pollDelayMs = 1000;
-    let found = false;
-    for (let i = 0; i < pollAttempts; i++) {
-      try {
-        const collections = await getCollectionFields(
-          payload.framerProjectUrl,
-          framerApiKey,
-          collection.collectionId,
-        );
-        if (collections && collections.length > 0) {
-          found = true;
-          break;
-        }
-      } catch (err) {
-        // ignore, will retry
-      }
-      await sleep(pollDelayMs);
-    }
-    if (!found) {
-      eventLogger("error", "framer_sync", "Collection not found after polling", { collectionName: collection.collectionName });
-      throw new Error(`Managed collection not found after creation and polling: ${collection.collectionName}`);
-    }
-  }
-
+  let collection;
   let fieldsSet = 0;
-  if (!isRowSync || collection.created) {
-    fieldsSet = await setCollectionFields(
-      payload.framerProjectUrl,
-      framerApiKey,
-      collection.collectionId,
-      mappingResult.fields,
-    );
-  }
-
-  if (mappingResult.items.length > 0) {
-
-    let itemsToAdd = mappingResult.items;
-    let existingItemIds = [];
-
-    try {
-      existingItemIds = await getManagedCollectionItemIds(
-        payload.framerProjectUrl,
-        framerApiKey,
-        collection.collectionId,
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      eventLogger("warning", "framer_sync", "Could not fetch existing item ids before add", {
-        message,
-      });
-    }
-
-    const codaFieldIdToName = new Map(
-      mappingResult.fields.map((field) => [field.id, field.name]),
-    );
-    let collectionFields = await getCollectionFields(
-      payload.framerProjectUrl,
-      framerApiKey,
-      collection.collectionId,
-    );
-    let collectionFieldNameToId = new Map(
-      collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
-    );
-
-    function remapItems(items) {
-      return items.map((item) => {
-        const remappedFieldData = {};
-        const originalFieldData = item?.fieldData || {};
-        for (const [sourceFieldId, fieldValue] of Object.entries(originalFieldData)) {
-          const sourceFieldName = codaFieldIdToName.get(sourceFieldId);
-          if (!sourceFieldName) continue;
-          const targetFieldId = collectionFieldNameToId.get(String(sourceFieldName).toLowerCase());
-          if (!targetFieldId) continue;
-          remappedFieldData[targetFieldId] = fieldValue;
-        }
-        return {
-          ...item,
-          fieldData: remappedFieldData,
-        };
-      });
-    }
-
-    itemsToAdd = remapItems(mappingResult.items);
-
-    // Retry logic for first sync/collection creation
-    let addItemsAttempted = false;
-    let addItemsError = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await addItemsToCollection(
-          payload.framerProjectUrl,
-          framerApiKey,
-          collection.collectionId,
-          itemsToAdd,
-        );
-        addItemsAttempted = true;
-        break;
-      } catch (err) {
-        addItemsError = err;
-        const msg = String(err && err.message ? err.message : err);
-        if (
-          attempt === 0 &&
-          collection.created &&
-          /field not found/i.test(msg)
-        ) {
-          eventLogger("warning", "framer_sync", "Retrying addItems after collection creation and schema refresh", { msg });
-          // Wait briefly and re-fetch schema, then retry
-          await sleep(1500);
-          collectionFields = await getCollectionFields(
-            payload.framerProjectUrl,
-            framerApiKey,
-            collection.collectionId,
-          );
-          collectionFieldNameToId = new Map(
-            collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
-          );
-          itemsToAdd = remapItems(mappingResult.items);
-          continue;
-        } else {
-          throw err;
-        }
-      }
-    }
-    if (!addItemsAttempted && addItemsError) {
-      throw addItemsError;
-    }
-
-    if (isRowSync && !collection.created) {
-      const allowedFieldIds = new Set(
-        await getCollectionFieldIds(
-          payload.framerProjectUrl,
-          framerApiKey,
-          collection.collectionId,
-        ),
-      );
-
-      itemsToAdd = mappingResult.items.map((item) => {
-        const filteredFieldData = {};
-        const originalFieldData = item?.fieldData || {};
-        for (const [fieldId, fieldValue] of Object.entries(originalFieldData)) {
-          if (allowedFieldIds.has(fieldId)) {
-            filteredFieldData[fieldId] = fieldValue;
-          }
-        }
-        return {
-          ...item,
-          fieldData: filteredFieldData,
-        };
-      });
-
-      await addItemsToCollection(
-        payload.framerProjectUrl,
-        framerApiKey,
-        collection.collectionId,
-        itemsToAdd,
-      );
-    }
-
-    try {
-      const afterItemIds = await getManagedCollectionItemIds(
-        payload.framerProjectUrl,
-        framerApiKey,
-        collection.collectionId,
-      );
-      const beforeSet = new Set(existingItemIds);
-      const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
-      const expectedNewIds = Array.from(submittedIds).filter((id) => !beforeSet.has(id));
-      const afterSet = new Set(afterItemIds);
-      const missingNewIds = expectedNewIds.filter((id) => !afterSet.has(id));
-
-      if (missingNewIds.length > 0) {
-        const warning = `Submitted ${itemsToAdd.length} items, but ${missingNewIds.length} expected new id(s) were not present after add: ${missingNewIds.join(", ")}`;
-        mappingResult.warnings.push(warning);
-        eventLogger("warning", "framer_sync", "Some submitted item IDs were not visible after add", {
-          missingNewIds,
-        });
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      eventLogger("warning", "framer_sync", "Could not verify item ids after add", { message });
-    }
-  }
-
   let itemsRemoved = 0;
-  if (!isRowSync && payload.deleteMissing) {
-    const codaItemIds = new Set(mappingResult.items.map((item) => String(item.id)));
-    const managedItemIds = await getManagedCollectionItemIds(
-      payload.framerProjectUrl,
-      framerApiKey,
-      collection.collectionId,
-    );
-    const toRemove = managedItemIds.filter((id) => !codaItemIds.has(String(id)));
-
-    if (toRemove.length > 0) {
-      itemsRemoved = await removeItemsFromManagedCollection(
-        payload.framerProjectUrl,
-        framerApiKey,
-        collection.collectionId,
-        toRemove,
-      );
-    }
-  }
-
   let publishResult = null;
   let publishError = "";
   const publishRequested = Boolean(payload.publish);
-  if (payload.publish) {
-    eventLogger("info", "publishing", "Publishing project");
-    try {
-      publishResult = await publishProject(
-        payload.framerProjectUrl,
-        framerApiKey,
-      );
-    } catch (error) {
-      publishError = error instanceof Error ? error.message : String(error);
-      eventLogger("warning", "publishing", "Publish failed after successful sync", {
-        error: publishError,
-      });
-    }
-  }
+
+  await runSyncSession(
+    payload.framerProjectUrl,
+    framerApiKey,
+    payload.collectionName,
+    async ({ framer, collection: collectionHandle, collectionMeta, timeoutMs }) => {
+      collection = collectionMeta;
+
+      // If collection was just created but not found, poll within the same session
+      if (collection.created && collection.foundAfterCreate === false) {
+        const pollAttempts = 5;
+        const pollDelayMs = 1000;
+        let found = false;
+        for (let i = 0; i < pollAttempts; i++) {
+          try {
+            const refreshed = await withTimeout(
+              framer.getManagedCollections(),
+              timeoutMs,
+              "getManagedCollections (poll)",
+            );
+            if (refreshed.find((item) => item.id === collection.collectionId)) {
+              found = true;
+              break;
+            }
+          } catch {
+            // ignore, will retry
+          }
+          await sleep(pollDelayMs);
+        }
+        if (!found) {
+          eventLogger("error", "framer_sync", "Collection not found after polling", { collectionName: collection.collectionName });
+          throw new Error(`Managed collection not found after creation and polling: ${collection.collectionName}`);
+        }
+      }
+
+      // Set fields
+      if (!isRowSync || collection.created) {
+        const compatibleFields = mappingResult.fields.filter(Boolean);
+        await withTimeout(
+          collectionHandle.setFields(compatibleFields),
+          timeoutMs,
+          "setCollectionFields",
+        );
+        fieldsSet = compatibleFields.length;
+      }
+
+      if (mappingResult.items.length > 0) {
+        // Fetch existing item IDs before add
+        let existingItemIds = [];
+        try {
+          if (typeof collectionHandle.getItemIds === "function") {
+            const ids = await withTimeout(
+              collectionHandle.getItemIds(),
+              timeoutMs,
+              "getManagedCollectionItemIds (before add)",
+            );
+            existingItemIds = Array.isArray(ids) ? ids.map((id) => String(id)) : [];
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          eventLogger("warning", "framer_sync", "Could not fetch existing item ids before add", { message });
+        }
+
+        // Fetch collection fields for remapping (use object fields first, fall back to getFields)
+        const codaFieldIdToName = new Map(
+          mappingResult.fields.map((field) => [field.id, field.name]),
+        );
+
+        async function fetchFields() {
+          let normalized = normalizeCollectionFieldsLocal(collectionHandle?.fields);
+          if (normalized.length > 0) return normalized;
+          if (typeof collectionHandle.getFields === "function") {
+            const fetched = await withTimeout(collectionHandle.getFields(), timeoutMs, "getCollectionFields");
+            normalized = normalizeCollectionFieldsLocal(fetched);
+          }
+          return normalized;
+        }
+
+        let collectionFields = await fetchFields();
+        let collectionFieldNameToId = new Map(
+          collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
+        );
+
+        function remapItems(items) {
+          return items.map((item) => {
+            const remappedFieldData = {};
+            for (const [sourceFieldId, fieldValue] of Object.entries(item?.fieldData || {})) {
+              const sourceFieldName = codaFieldIdToName.get(sourceFieldId);
+              if (!sourceFieldName) continue;
+              const targetFieldId = collectionFieldNameToId.get(String(sourceFieldName).toLowerCase());
+              if (!targetFieldId) continue;
+              remappedFieldData[targetFieldId] = fieldValue;
+            }
+            return { ...item, fieldData: remappedFieldData };
+          });
+        }
+
+        let itemsToAdd = remapItems(mappingResult.items);
+
+        // Add items with one retry on field-not-found after schema refresh
+        let addItemsAttempted = false;
+        let addItemsError = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            await withTimeout(
+              collectionHandle.addItems(itemsToAdd),
+              timeoutMs,
+              "addItemsToCollection (bulk)",
+            );
+            addItemsAttempted = true;
+            break;
+          } catch (err) {
+            addItemsError = err;
+            const msg = String(err?.message ?? err);
+            if (attempt === 0 && collection.created && /field not found/i.test(msg)) {
+              eventLogger("warning", "framer_sync", "Retrying addItems after collection creation and schema refresh", { msg });
+              await sleep(1500);
+              collectionFields = await fetchFields();
+              collectionFieldNameToId = new Map(
+                collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
+              );
+              itemsToAdd = remapItems(mappingResult.items);
+              continue;
+            } else {
+              throw err;
+            }
+          }
+        }
+        if (!addItemsAttempted && addItemsError) throw addItemsError;
+
+        // rowSync path: filter to known field IDs and add again
+        if (isRowSync && !collection.created) {
+          const allowedFieldIds = new Set(collectionFields.map((f) => f.id));
+          itemsToAdd = mappingResult.items.map((item) => {
+            const filteredFieldData = {};
+            for (const [fieldId, fieldValue] of Object.entries(item?.fieldData || {})) {
+              if (allowedFieldIds.has(fieldId)) filteredFieldData[fieldId] = fieldValue;
+            }
+            return { ...item, fieldData: filteredFieldData };
+          });
+          await withTimeout(
+            collectionHandle.addItems(itemsToAdd),
+            timeoutMs,
+            "addItemsToCollection (rowSync)",
+          );
+        }
+
+        // Verify items landed
+        try {
+          if (typeof collectionHandle.getItemIds === "function") {
+            const afterItemIds = await withTimeout(
+              collectionHandle.getItemIds(),
+              timeoutMs,
+              "getManagedCollectionItemIds (after add)",
+            );
+            const afterIds = Array.isArray(afterItemIds) ? afterItemIds.map((id) => String(id)) : [];
+            const beforeSet = new Set(existingItemIds);
+            const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
+            const expectedNewIds = Array.from(submittedIds).filter((id) => !beforeSet.has(id));
+            const afterSet = new Set(afterIds);
+            const missingNewIds = expectedNewIds.filter((id) => !afterSet.has(id));
+            if (missingNewIds.length > 0) {
+              const warning = `Submitted ${itemsToAdd.length} items, but ${missingNewIds.length} expected new id(s) were not present after add: ${missingNewIds.join(", ")}`;
+              mappingResult.warnings.push(warning);
+              eventLogger("warning", "framer_sync", "Some submitted item IDs were not visible after add", { missingNewIds });
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          eventLogger("warning", "framer_sync", "Could not verify item ids after add", { message });
+        }
+      }
+
+      // Delete missing items
+      if (!isRowSync && payload.deleteMissing) {
+        const codaItemIds = new Set(mappingResult.items.map((item) => String(item.id)));
+        let managedItemIds = [];
+        if (typeof collectionHandle.getItemIds === "function") {
+          const ids = await withTimeout(collectionHandle.getItemIds(), timeoutMs, "getManagedCollectionItemIds (deleteMissing)");
+          managedItemIds = Array.isArray(ids) ? ids.map((id) => String(id)) : [];
+        }
+        const toRemove = managedItemIds.filter((id) => !codaItemIds.has(id));
+        if (toRemove.length > 0) {
+          await withTimeout(
+            collectionHandle.removeItems(toRemove),
+            timeoutMs,
+            "removeManagedCollectionItems",
+          );
+          itemsRemoved = toRemove.length;
+        }
+      }
+
+      // Publish within the same session
+      if (payload.publish) {
+        eventLogger("info", "publishing", "Publishing project");
+        const publishTimeoutMs = getPublishTimeoutMs();
+        try {
+          let rawResult;
+          try {
+            rawResult = await withTimeout(framer.publish(), publishTimeoutMs, "publishProject");
+          } catch (error) {
+            const formatted = formatFramerError("publish", error);
+            log("error", "publish_failed", { projectUrl: payload.framerProjectUrl, ...formatted.fields });
+            throw new Error(formatted.message);
+          }
+
+          const deploymentId = rawResult?.deployment?.id || "";
+          log("info", "publish_result", {
+            projectUrl: payload.framerProjectUrl,
+            deploymentId,
+            hostnamesCount: Array.isArray(rawResult?.hostnames) ? rawResult.hostnames.length : 0,
+          });
+
+          if (!deploymentId) {
+            throw new Error("publish failed | missing deployment id in publish result");
+          }
+
+          try {
+            await withTimeout(framer.deploy(deploymentId), publishTimeoutMs, "deployProject");
+          } catch (error) {
+            const formatted = formatFramerError("deploy", error);
+            log("error", "deploy_failed", { projectUrl: payload.framerProjectUrl, deploymentId, ...formatted.fields });
+            throw new Error(formatted.message);
+          }
+
+          log("info", "deploy_complete", { projectUrl: payload.framerProjectUrl, deploymentId });
+          publishResult = { published: true, changeCount: 1, deploymentId, message: "Successfully published and deployed" };
+        } catch (error) {
+          publishError = error instanceof Error ? error.message : String(error);
+          eventLogger("warning", "publishing", "Publish failed after successful sync", { error: publishError });
+        }
+      }
+    },
+  );
 
   const publishSucceeded = Boolean(publishResult?.published);
   const overallSuccess = !publishRequested || publishSucceeded;
