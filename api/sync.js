@@ -1038,6 +1038,9 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
           cellsToUpdate,
           codaApiToken,
         );
+        lastRowUpdateError = null;
+        break;
+      } catch (rowErr) {
         lastRowUpdateError = rowErr;
         const msg = rowErr instanceof Error ? rowErr.message : String(rowErr);
         const isNotFound = (rowErr && rowErr.status === 404) || /404\s+Not\s+Found/i.test(msg) || /row not found/i.test(msg.toLowerCase());
@@ -1103,8 +1106,6 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
             eventLogger("warn", "callback", "Skipping recreate of callback row because rowWasCreatedHere is true");
           }
         }
-      } catch (rowErr) {
-        lastRowUpdateError = rowErr;
       }
     }
 
@@ -1177,7 +1178,7 @@ async function processJob(jobId, context = {}) {
     job.payload.initialDelayMs ?? process.env.CODA_INITIAL_DELAY_MS ?? 1200,
     1200,
     0,
-    30000,
+    120000,
   );
 
   if (initialDelayMs > 0) {

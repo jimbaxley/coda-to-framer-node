@@ -13,6 +13,10 @@ Optional retry/fallback tuning:
 
 - `CODA_API_RETRY_ATTEMPTS` - retries for transient Coda HTTP/network failures (default: `3`)
 - `CODA_API_RETRY_DELAY_MS` - base delay between Coda API retries (default: `800`)
+- `CODA_LATEST_VERSION_RETRY_ATTEMPTS` - retries when Coda says `X-Coda-Doc-Version: latest` cannot be served because mutations are pending (default: `20`)
+- `CODA_LATEST_VERSION_RETRY_DELAY_MS` - base delay between latest-version retries (default: `1000`)
+- `CODA_MUTATION_STATUS_RETRY_ATTEMPTS` - mutation-status polls after Coda API writes (default: `20`)
+- `CODA_MUTATION_STATUS_RETRY_DELAY_MS` - base delay between Coda mutation-status polls (default: `1000`)
 - `CODA_STATE_RETRY_ATTEMPTS` - retries when mapping warnings suggest Coda UI write lag (default: `3`)
 - `CODA_STATE_RETRY_DELAY_MS` - base delay for warning-triggered Coda snapshot retries (default: `1200`)
 - `FRAMER_RETRY_ATTEMPTS` - retries for transient Framer connection/session/network failures (default: `3`)
@@ -22,7 +26,7 @@ Optional retry/fallback tuning:
 - `FRAMER_ADD_CHUNK_SIZE` - chunk size used after bulk add timeout fallback (default: `2`)
 - `FRAMER_ADD_CHUNK_TIMEOUT_MS` - timeout for each chunk fallback add call (default: min(operation timeout, `12000`))
 - `FRAMER_ADD_PER_ITEM_TIMEOUT_MS` - timeout for final per-item fallback adds (default: min(operation timeout, `8000`))
-- `CODA_INITIAL_DELAY_MS` - initial delay before extraction to allow recent Coda UI edits to become API-visible (default: `1200`)
+- `CODA_INITIAL_DELAY_MS` - initial delay before extraction to allow recent Coda UI edits to become API-visible (default: `1200`, max `120000`)
 
 ## Securing the API Endpoint
 
@@ -102,6 +106,8 @@ Status endpoint:
 - For table sync, set `deleteMissing: true` to remove managed collection items that are no longer present in the Coda table snapshot.
 - When Coda returns transient empty slug values during recent UI edits, the handler retries Coda snapshot/mapping before returning warnings.
 - `initialDelayMs` (or env default `CODA_INITIAL_DELAY_MS`) is applied before extract to mitigate Coda UI/API propagation lag.
+- Coda API requests include `X-Coda-Doc-Version: latest`, so reads retry while Coda reports pending mutations instead of silently reading an older snapshot.
+- Coda API callback writes poll the Coda mutation-status endpoint when the write response includes a mutation request id.
 - When Framer bulk add times out, the handler falls back to chunked adds first, then per-item only for failed chunks.
 
 ## Coda maker callback quick-start
