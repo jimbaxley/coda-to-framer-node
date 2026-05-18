@@ -19,6 +19,7 @@
   - `FRAMER_ADD_CHUNK_SIZE`, `FRAMER_ADD_CHUNK_TIMEOUT_MS`, `FRAMER_ADD_PER_ITEM_TIMEOUT_MS`
 
 ### Changed
+- Coda callback writes now treat `Doc is not yet up to date.` as a latest-version retry condition.
 - `CODA_INITIAL_DELAY_MS` and `initialDelayMs` can now be configured up to 120 seconds.
 - Row sync now skips schema updates on existing collections to reduce latency.
 - Framer operations now include explicit timeouts and retry handling for common transient failures.
