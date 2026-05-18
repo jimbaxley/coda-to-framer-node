@@ -106,7 +106,7 @@ Status endpoint:
 - For table sync, set `deleteMissing: true` to remove managed collection items that are no longer present in the Coda table snapshot.
 - When Coda returns transient empty slug values during recent UI edits, the handler retries Coda snapshot/mapping before returning warnings.
 - `initialDelayMs` (or env default `CODA_INITIAL_DELAY_MS`) is applied before extract to mitigate Coda UI/API propagation lag.
-- Coda API requests include `X-Coda-Doc-Version: latest`, so reads retry while Coda reports pending mutations instead of silently reading an older snapshot.
+- Source Coda row/table extraction requests include `X-Coda-Doc-Version: latest`, so sync reads retry while Coda reports pending mutations instead of silently reading an older snapshot. Callback/status-log bookkeeping does not use this header.
 - Coda API callback writes poll the Coda mutation-status endpoint when the write response includes a mutation request id.
 - When Framer bulk add times out, the handler falls back to chunked adds first, then per-item only for failed chunks.
 

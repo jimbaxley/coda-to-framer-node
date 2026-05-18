@@ -363,6 +363,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
             payload.tableIdOrName,
             payload.rowId,
             codaApiToken,
+            { requireLatest: true },
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -378,6 +379,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
           payload.tableIdOrName,
           codaApiToken,
           payload.rowLimit || 500,
+          { requireLatest: true },
         );
         const matchedRow = findRowBySelector(selectorData, payload.rowId, resolvedSlugFieldId);
         if (!matchedRow) {
@@ -397,6 +399,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         payload.tableIdOrName,
         codaApiToken,
         payload.rowLimit || 100,
+        { requireLatest: true },
       );
     }
 

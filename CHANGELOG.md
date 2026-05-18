@@ -19,6 +19,7 @@
   - `FRAMER_ADD_CHUNK_SIZE`, `FRAMER_ADD_CHUNK_TIMEOUT_MS`, `FRAMER_ADD_PER_ITEM_TIMEOUT_MS`
 
 ### Changed
+- `X-Coda-Doc-Version: latest` is now limited to source row/table extraction, not callback/status-log bookkeeping.
 - Latest-version retries now default to 5 attempts and clamp at 8 attempts to avoid long foreground waits.
 - Missing Coda mutation-status resources no longer fail an already-accepted callback write.
 - Coda callback writes now treat `Doc is not yet up to date.` as a latest-version retry condition.
