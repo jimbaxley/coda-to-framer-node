@@ -13,7 +13,7 @@ Optional retry/fallback tuning:
 
 - `CODA_API_RETRY_ATTEMPTS` - retries for transient Coda HTTP/network failures (default: `3`)
 - `CODA_API_RETRY_DELAY_MS` - base delay between Coda API retries (default: `800`)
-- `CODA_LATEST_VERSION_RETRY_ATTEMPTS` - retries when Coda says `X-Coda-Doc-Version: latest` cannot be served because mutations are pending (default: `20`)
+- `CODA_LATEST_VERSION_RETRY_ATTEMPTS` - retries when Coda says `X-Coda-Doc-Version: latest` cannot be served because mutations are pending (default: `5`, max `8`)
 - `CODA_LATEST_VERSION_RETRY_DELAY_MS` - base delay between latest-version retries (default: `1000`)
 - `CODA_MUTATION_STATUS_RETRY_ATTEMPTS` - mutation-status polls after Coda API writes (default: `20`)
 - `CODA_MUTATION_STATUS_RETRY_DELAY_MS` - base delay between Coda mutation-status polls (default: `1000`)

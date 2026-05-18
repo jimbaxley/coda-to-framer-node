@@ -19,6 +19,8 @@
   - `FRAMER_ADD_CHUNK_SIZE`, `FRAMER_ADD_CHUNK_TIMEOUT_MS`, `FRAMER_ADD_PER_ITEM_TIMEOUT_MS`
 
 ### Changed
+- Latest-version retries now default to 5 attempts and clamp at 8 attempts to avoid long foreground waits.
+- Missing Coda mutation-status resources no longer fail an already-accepted callback write.
 - Coda callback writes now treat `Doc is not yet up to date.` as a latest-version retry condition.
 - `CODA_INITIAL_DELAY_MS` and `initialDelayMs` can now be configured up to 120 seconds.
 - Row sync now skips schema updates on existing collections to reduce latency.
