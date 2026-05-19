@@ -245,6 +245,14 @@ function getDefaultCallbackTableName() {
   return String(process.env.CODA_CALLBACK_TABLE_NAME || "Framer Sync Log").trim();
 }
 
+function parseBooleanFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 async function provisionCallbackRowIfNeeded(payload, { requestId, jobId, vercelTrace }) {
   const callback = payload?.callback || {};
   const hasExplicitCallbackTable = Object.prototype.hasOwnProperty.call(callback, "statusTableIdOrName")
@@ -338,12 +346,23 @@ async function executeSyncWorkflow(payload, eventLogger) {
   }
 
   let resolvedSlugFieldId = payload.slugFieldId;
+  const codaReadOptions = {
+    requireLatest: parseBooleanFlag(
+      payload.requireLatestCodaSnapshot ?? process.env.CODA_REQUIRE_LATEST_SOURCE_READS,
+      false,
+    ),
+  };
+  eventLogger("info", "extract", "Configured Coda snapshot read mode", {
+    requireLatest: codaReadOptions.requireLatest,
+  });
+
   if (payload.slugFieldId) {
     resolvedSlugFieldId = await resolveColumnNameOrId(
       payload.docId,
       payload.tableIdOrName,
       payload.slugFieldId,
       codaApiToken,
+      codaReadOptions,
     );
     if (resolvedSlugFieldId !== payload.slugFieldId) {
       eventLogger("info", "resolve_slug", "Resolved slug field ID", {
@@ -363,7 +382,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
             payload.tableIdOrName,
             payload.rowId,
             codaApiToken,
-            { requireLatest: true },
+            codaReadOptions,
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -379,7 +398,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
           payload.tableIdOrName,
           codaApiToken,
           payload.rowLimit || 500,
-          { requireLatest: true },
+          codaReadOptions,
         );
         const matchedRow = findRowBySelector(selectorData, payload.rowId, resolvedSlugFieldId);
         if (!matchedRow) {
@@ -399,7 +418,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         payload.tableIdOrName,
         codaApiToken,
         payload.rowLimit || 100,
-        { requireLatest: true },
+        codaReadOptions,
       );
     }
 
@@ -1462,11 +1481,14 @@ export default async function handler(req, res) {
 
     const requestId = payload.requestId || randomUUID();
     const jobId = randomUUID();
-    const payloadWithCallbackRow = await provisionCallbackRowIfNeeded(payload, {
-      requestId,
-      jobId,
-      vercelTrace,
-    });
+    const shouldPreResolveCallback = parseBooleanFlag(process.env.CODA_PRE_RESOLVE_CALLBACK, false);
+    const payloadWithCallbackRow = shouldPreResolveCallback
+      ? await provisionCallbackRowIfNeeded(payload, {
+        requestId,
+        jobId,
+        vercelTrace,
+      })
+      : payload;
     createJob({
       jobId,
       requestId,

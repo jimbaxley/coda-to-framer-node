@@ -13,12 +13,14 @@ Optional retry/fallback tuning:
 
 - `CODA_API_RETRY_ATTEMPTS` - retries for transient Coda HTTP/network failures (default: `3`)
 - `CODA_API_RETRY_DELAY_MS` - base delay between Coda API retries (default: `800`)
+- `CODA_REQUIRE_LATEST_SOURCE_READS` - opt into `X-Coda-Doc-Version: latest` for source row/table extraction (default: `false`)
 - `CODA_LATEST_VERSION_RETRY_ATTEMPTS` - retries when Coda says `X-Coda-Doc-Version: latest` cannot be served because mutations are pending (default: `5`, max `8`)
 - `CODA_LATEST_VERSION_RETRY_DELAY_MS` - base delay between latest-version retries (default: `1000`)
 - `CODA_MUTATION_STATUS_RETRY_ATTEMPTS` - mutation-status polls after Coda API writes (default: `20`)
 - `CODA_MUTATION_STATUS_RETRY_DELAY_MS` - base delay between Coda mutation-status polls (default: `1000`)
 - `CODA_STATE_RETRY_ATTEMPTS` - retries when mapping warnings suggest Coda UI write lag (default: `3`)
 - `CODA_STATE_RETRY_DELAY_MS` - base delay for warning-triggered Coda snapshot retries (default: `1200`)
+- `CODA_PRE_RESOLVE_CALLBACK` - resolve callback table/column IDs before returning `202` (default: `false`; keep disabled for low Coda Pack timeouts)
 - `FRAMER_RETRY_ATTEMPTS` - retries for transient Framer connection/session/network failures (default: `3`)
 - `FRAMER_RETRY_DELAY_MS` - base delay between Framer retries (default: `1000`)
 - `FRAMER_CONNECT_TIMEOUT_MS` - connection timeout cap for Framer connect calls (default: `30000`, max `30000`)
@@ -106,7 +108,8 @@ Status endpoint:
 - For table sync, set `deleteMissing: true` to remove managed collection items that are no longer present in the Coda table snapshot.
 - When Coda returns transient empty slug values during recent UI edits, the handler retries Coda snapshot/mapping before returning warnings.
 - `initialDelayMs` (or env default `CODA_INITIAL_DELAY_MS`) is applied before extract to mitigate Coda UI/API propagation lag.
-- Source Coda row/table extraction requests include `X-Coda-Doc-Version: latest`, so sync reads retry while Coda reports pending mutations instead of silently reading an older snapshot. Callback/status-log bookkeeping does not use this header.
+- Source Coda row/table extraction uses normal snapshot reads by default so Coda snapshot lag does not block syncs. Set `CODA_REQUIRE_LATEST_SOURCE_READS=true` or send `requireLatestCodaSnapshot: true` only when you explicitly want `X-Coda-Doc-Version: latest` to hard-gate source reads.
+- Callback/status-log bookkeeping does not use `X-Coda-Doc-Version: latest`.
 - Coda API callback writes poll the Coda mutation-status endpoint when the write response includes a mutation request id.
 - When Framer bulk add times out, the handler falls back to chunked adds first, then per-item only for failed chunks.
 

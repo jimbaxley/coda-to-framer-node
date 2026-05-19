@@ -19,6 +19,8 @@
   - `FRAMER_ADD_CHUNK_SIZE`, `FRAMER_ADD_CHUNK_TIMEOUT_MS`, `FRAMER_ADD_PER_ITEM_TIMEOUT_MS`
 
 ### Changed
+- Source reads now use normal Coda snapshot reads by default; `X-Coda-Doc-Version: latest` is opt-in via `CODA_REQUIRE_LATEST_SOURCE_READS` or `requireLatestCodaSnapshot`.
+- Request acceptance no longer pre-resolves callback table/column IDs by default, keeping Coda Pack calls fast for short timeouts.
 - `X-Coda-Doc-Version: latest` is now limited to source row/table extraction, not callback/status-log bookkeeping.
 - Latest-version retries now default to 5 attempts and clamp at 8 attempts to avoid long foreground waits.
 - Missing Coda mutation-status resources no longer fail an already-accepted callback write.
