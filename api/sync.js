@@ -537,6 +537,28 @@ async function executeSyncWorkflow(payload, eventLogger) {
         // Build codaRefTableId → framerCollectionId by finding which other Framer collection
         // contains the item IDs referenced by each lookup field.
         const codaTableIdToFramerCollectionId = new Map();
+
+        // If linkedCollectionName is provided, pre-seed all lookup fields with that collection.
+        // This is the escape hatch for formula/computed lookup columns whose row values
+        // can't be matched by the ID-scan loop (e.g. Sizes → Products via a formula column).
+        if (payload.linkedCollectionName) {
+          const linkedName = String(payload.linkedCollectionName).trim().toLowerCase();
+          const linkedCol = otherCollections.find((c) => String(c.name || "").toLowerCase() === linkedName);
+          if (linkedCol) {
+            for (const lf of mappingResult.allMappedFields.filter((f) => f.type === "lookup")) {
+              codaTableIdToFramerCollectionId.set(lf.codaRefTableId, linkedCol.id);
+            }
+            eventLogger("info", "framer_sync", "Pre-seeded reference fields from linkedCollectionName", {
+              linkedCollectionName: payload.linkedCollectionName,
+              framerCollectionId: linkedCol.id,
+            });
+          } else {
+            eventLogger("warning", "framer_sync", "linkedCollectionName not found in Framer collections", {
+              linkedCollectionName: payload.linkedCollectionName,
+            });
+          }
+        }
+
         const lookupFields = mappingResult.allMappedFields.filter((f) => f.type === "lookup");
 
         for (const lookupField of lookupFields) {
