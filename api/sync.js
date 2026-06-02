@@ -4,6 +4,7 @@ import {
   getCodaTableData,
   getCodaRowData,
   getCodaTableColumns,
+  getCodaTables,
   resolveColumnNameOrId,
   resolveTableNameOrId,
   updateTableCell,
@@ -530,7 +531,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         );
         // Skip the current collection itself
         const otherCollections = allFramerCollections.filter(
-          (c) => c.id !== collectionHandle.id,
+          (c) => c.id !== collection.collectionId,
         );
 
         // Build codaRefTableId → framerCollectionId by finding which other Framer collection
@@ -581,6 +582,11 @@ async function executeSyncWorkflow(payload, eventLogger) {
           mappingResult.allMappedFields,
           codaTableIdToFramerCollectionId,
         );
+        eventLogger("info", "framer_sync", "Reference fields resolved", {
+          resolvedRefFields: resolvedRefFields.map((f) => ({ id: f.id, name: f.name, type: f.type, collectionId: f.collectionId })),
+        });
+        // Track which lookup field IDs were successfully resolved so addItems can skip the rest
+        const resolvedRefFieldIds = new Set(resolvedRefFields.map((f) => f.id));
         const compatibleFields = [
           ...mappingResult.fields.filter(Boolean),
           ...resolvedRefFields,
@@ -591,6 +597,17 @@ async function executeSyncWorkflow(payload, eventLogger) {
           "setCollectionFields",
         );
         fieldsSet = compatibleFields.length;
+
+        // Store resolved ref field IDs on mappingResult so addItems remapping can use it
+        mappingResult._resolvedRefFieldIds = resolvedRefFieldIds;
+        const unresolvedLookups = mappingResult.allMappedFields
+          .filter((f) => f.type === "lookup" && !resolvedRefFieldIds.has(f.id))
+          .map((f) => f.name);
+        if (unresolvedLookups.length > 0) {
+          eventLogger("warning", "framer_sync", "Some lookup fields could not be resolved to a Framer collection and will be skipped", {
+            unresolvedLookups,
+          });
+        }
       }
 
       if (mappingResult.items.length > 0) {
@@ -631,10 +648,20 @@ async function executeSyncWorkflow(payload, eventLogger) {
           collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
         );
 
+        // Build a set of field IDs that are unresolved lookups (type still "lookup" / reference
+        // type but no Framer collectionId found). These must be excluded from addItems or Framer
+        // throws "Expected a collection node".
+        const unresolvedLookupFieldIds = new Set(
+          (mappingResult.allMappedFields || [])
+            .filter((f) => f.type === "lookup" && !(mappingResult._resolvedRefFieldIds?.has(f.id)))
+            .map((f) => f.id),
+        );
+
         function remapItems(items) {
           return items.map((item) => {
             const remappedFieldData = {};
             for (const [sourceFieldId, fieldValue] of Object.entries(item?.fieldData || {})) {
+              if (unresolvedLookupFieldIds.has(sourceFieldId)) continue;
               const sourceFieldName = codaFieldIdToName.get(sourceFieldId);
               if (!sourceFieldName) continue;
               const targetFieldId = collectionFieldNameToId.get(String(sourceFieldName).toLowerCase());
