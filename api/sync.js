@@ -534,10 +534,6 @@ async function executeSyncWorkflow(payload, eventLogger) {
           (c) => c.id !== collection.collectionId,
         );
 
-        eventLogger("info", "framer_sync", "Available managed collections for reference resolution", {
-          allCollections: allFramerCollections.map((c) => ({ id: c.id, name: c.name })),
-        });
-
         // Build codaRefTableId → framerCollectionId by finding which other Framer collection
         // contains the item IDs referenced by each lookup field.
         const codaTableIdToFramerCollectionId = new Map();
