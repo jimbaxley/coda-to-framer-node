@@ -14,7 +14,6 @@ import {
   normalizeColumns,
   normalizeRows,
   buildFieldsAndItems,
-  resolveReferenceFields,
 } from "../lib/mapping.js";
 import {
   publishProject,
@@ -519,53 +518,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
       // Set fields
       if (!isRowSync || collection.created) {
-        // Resolve lookup/reference fields to multiCollectionReference using Framer collection IDs.
-        // We build a map from Coda table ID → Framer collection ID by matching collection names.
-        const allFramerCollections = await withTimeout(
-          framer.getManagedCollections(),
-          timeoutMs,
-          "getManagedCollections (for reference resolution)",
-        );
-        // Map Coda objectId (table ID) → Framer collection ID by finding collections whose
-        // items share the same Coda row IDs. We match by name as a heuristic: the Coda
-        // format.objectId is e.g. "grid-9Jw_2FoM_b" and we look for a Framer collection
-        // whose name matches the collectionName from the FramerSync config rows.
-        // Since we don't have that mapping here, we store it from allMappedFields:
-        // each lookup field carries codaRefTableId. We match against all managed collections
-        // by trying to find one whose items include IDs that came from that Coda table.
-        // Simpler: we match Framer collection name against a lookup in the payload config.
-        // For now, build a map of ALL managed collection IDs keyed by their Framer collection id
-        // so resolveReferenceFields can match codaRefTableId → framerCollectionId via
-        // a side-channel: we pass a map pre-populated from the payload's own collection mapping
-        // if available, otherwise skip.
-        // Build codaTableId → framerCollectionId map.
-        // Strategy: match via payload.collectionRefMap entries, which map
-        // Coda table IDs to Framer collection names (stable) rather than IDs (change on recreate).
-        const codaTableIdToFramerCollectionId = new Map();
-        if (Array.isArray(payload.collectionRefMap)) {
-          for (const entry of payload.collectionRefMap) {
-            if (!entry.codaTableId) continue;
-            let framerCollectionId = entry.framerCollectionId || null;
-            // If framerCollectionName is given, resolve to ID from the live collection list
-            if (!framerCollectionId && entry.framerCollectionName) {
-              const match = allFramerCollections.find(
-                (c) => c.name === entry.framerCollectionName,
-              );
-              framerCollectionId = match?.id || null;
-            }
-            if (framerCollectionId) {
-              codaTableIdToFramerCollectionId.set(entry.codaTableId, framerCollectionId);
-            }
-          }
-        }
-        const resolvedRefFields = resolveReferenceFields(
-          mappingResult.allMappedFields,
-          codaTableIdToFramerCollectionId,
-        );
-        const compatibleFields = [
-          ...mappingResult.fields.filter(Boolean),
-          ...resolvedRefFields,
-        ];
+        const compatibleFields = mappingResult.fields.filter(Boolean);
         await withTimeout(
           collectionHandle.setFields(compatibleFields),
           timeoutMs,
@@ -592,9 +545,8 @@ async function executeSyncWorkflow(payload, eventLogger) {
         }
 
         // Fetch collection fields for remapping (use object fields first, fall back to getFields)
-        // Include allMappedFields so lookup/reference fields get remapped too
         const codaFieldIdToName = new Map(
-          (mappingResult.allMappedFields || mappingResult.fields).map((field) => [field.id, field.name]),
+          mappingResult.fields.map((field) => [field.id, field.name]),
         );
 
         async function fetchFields() {
