@@ -732,6 +732,15 @@ async function executeSyncWorkflow(payload, eventLogger) {
             ? Object.entries(itemsToAdd[0].fieldData || {}).map(([k, v]) => ({ k, type: v?.type }))
             : [],
         });
+        eventLogger("info", "framer_sync", "Reference field values snapshot", {
+          items: itemsToAdd.slice(0, 20).map((item) => ({
+            id: item.id,
+            slug: item.slug,
+            references: Object.entries(item.fieldData || {})
+              .filter(([, value]) => value?.type === "collectionReference" || value?.type === "multiCollectionReference")
+              .map(([fieldId, value]) => ({ fieldId, type: value.type, value: value.value })),
+          })),
+        });
 
         // Add items with one retry on field-not-found after schema refresh
         let addItemsAttempted = false;
