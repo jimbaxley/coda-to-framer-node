@@ -552,6 +552,13 @@ async function executeSyncWorkflow(payload, eventLogger) {
           }
           if (sampleIds.size === 0) continue;
 
+          eventLogger("info", "framer_sync", "Resolving reference field", {
+            field: lookupField.name,
+            codaRefTableId: lookupField.codaRefTableId,
+            sampleIds: [...sampleIds],
+            otherCollections: otherCollections.map((c) => ({ id: c.id, name: c.name })),
+          });
+
           // Find which other collection contains at least one of those IDs
           for (const otherCol of otherCollections) {
             if (typeof otherCol.getItemIds !== "function") continue;
@@ -562,6 +569,13 @@ async function executeSyncWorkflow(payload, eventLogger) {
                 `getItemIds (ref resolution: ${otherCol.name})`,
               );
               const idSet = new Set(Array.isArray(ids) ? ids.map(String) : []);
+              eventLogger("info", "framer_sync", "Scanned collection for ref IDs", {
+                field: lookupField.name,
+                collectionName: otherCol.name,
+                collectionId: otherCol.id,
+                idsInCollection: [...idSet].slice(0, 5),
+                matched: [...sampleIds].some((id) => idSet.has(id)),
+              });
               if ([...sampleIds].some((id) => idSet.has(id))) {
                 codaTableIdToFramerCollectionId.set(lookupField.codaRefTableId, otherCol.id);
                 eventLogger("info", "framer_sync", "Resolved reference field to collection", {
@@ -572,8 +586,13 @@ async function executeSyncWorkflow(payload, eventLogger) {
                 });
                 break;
               }
-            } catch {
-              // skip unresolvable collections
+            } catch (err) {
+              eventLogger("warning", "framer_sync", "getItemIds failed during ref resolution", {
+                field: lookupField.name,
+                collectionName: otherCol.name,
+                collectionId: otherCol.id,
+                error: err instanceof Error ? err.message : String(err),
+              });
             }
           }
         }
