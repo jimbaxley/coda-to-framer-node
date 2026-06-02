@@ -41,8 +41,10 @@ function normalizeCollectionFieldsLocal(fields) {
 import {
   sleep,
   parseIntEnv,
+  computeBackoffMs,
   shouldRetryForTransientCodaWarnings,
   isRetryableCodaError,
+  isRetryableFramerError,
 } from "../lib/retry-policy.js";
 import {
   createJob,
@@ -527,6 +529,43 @@ async function executeSyncWorkflow(payload, eventLogger) {
         fieldsSet = compatibleFields.length;
       }
 
+      async function fetchItemIds(operationName) {
+        if (typeof collectionHandle.getItemIds !== "function") return [];
+
+        const maxAttempts = parseIntEnv(process.env.FRAMER_RETRY_ATTEMPTS || 3, 3, 1, 6);
+        const baseDelayMs = parseIntEnv(process.env.FRAMER_RETRY_DELAY_MS || 1000, 1000, 0, 10000);
+        let lastError;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          try {
+            const ids = await withTimeout(
+              collectionHandle.getItemIds(),
+              timeoutMs,
+              operationName,
+            );
+            return Array.isArray(ids) ? ids.map((id) => String(id)) : [];
+          } catch (error) {
+            lastError = error;
+            if (!isRetryableFramerError(error) || attempt === maxAttempts) {
+              break;
+            }
+
+            const message = error instanceof Error ? error.message : String(error);
+            const waitMs = computeBackoffMs(baseDelayMs, attempt);
+            eventLogger("warning", "framer_sync", "Retrying item id read after transient Framer error", {
+              operationName,
+              attempt,
+              maxAttempts,
+              waitMs,
+              message,
+            });
+            await sleep(waitMs);
+          }
+        }
+
+        throw lastError;
+      }
+
       if (mappingResult.items.length > 0) {
         // Fetch existing item IDs before add
         let existingItemIds = [];
@@ -631,12 +670,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         // Verify items landed
         try {
           if (typeof collectionHandle.getItemIds === "function") {
-            const afterItemIds = await withTimeout(
-              collectionHandle.getItemIds(),
-              timeoutMs,
-              "getManagedCollectionItemIds (after add)",
-            );
-            const afterIds = Array.isArray(afterItemIds) ? afterItemIds.map((id) => String(id)) : [];
+            const afterIds = await fetchItemIds("getManagedCollectionItemIds (after add)");
             const beforeSet = new Set(existingItemIds);
             const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
             const expectedNewIds = Array.from(submittedIds).filter((id) => !beforeSet.has(id));
@@ -659,8 +693,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         const codaItemIds = new Set(mappingResult.items.map((item) => String(item.id)));
         let managedItemIds = [];
         if (typeof collectionHandle.getItemIds === "function") {
-          const ids = await withTimeout(collectionHandle.getItemIds(), timeoutMs, "getManagedCollectionItemIds (deleteMissing)");
-          managedItemIds = Array.isArray(ids) ? ids.map((id) => String(id)) : [];
+          managedItemIds = await fetchItemIds("getManagedCollectionItemIds (deleteMissing)");
         }
         const toRemove = managedItemIds.filter((id) => !codaItemIds.has(id));
         if (toRemove.length > 0) {
