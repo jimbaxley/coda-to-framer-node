@@ -674,6 +674,13 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
         let itemsToAdd = remapItems(mappingResult.items);
 
+        eventLogger("info", "framer_sync", "addItems field types snapshot", {
+          unresolvedLookupFieldIds: [...unresolvedLookupFieldIds],
+          sampleFieldTypes: itemsToAdd[0]
+            ? Object.entries(itemsToAdd[0].fieldData || {}).map(([k, v]) => ({ k, type: v?.type }))
+            : [],
+        });
+
         // Add items with one retry on field-not-found after schema refresh
         let addItemsAttempted = false;
         let addItemsError = null;
