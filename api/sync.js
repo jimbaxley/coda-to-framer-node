@@ -519,45 +519,64 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
       // Set fields
       if (!isRowSync || collection.created) {
-        // Resolve lookup/reference fields to multiCollectionReference using Framer collection IDs.
-        // We build a map from Coda table ID → Framer collection ID by matching collection names.
+        // Resolve lookup fields to multiCollectionReference by matching the Coda ref row IDs
+        // against items already present in other Framer managed collections.
+        // No extra config needed — the Coda ref objects carry the row IDs (e.g. i-BTOhjxRAt7)
+        // which are the same as the Framer item IDs since we use Coda row IDs as Framer item IDs.
         const allFramerCollections = await withTimeout(
           framer.getManagedCollections(),
           timeoutMs,
           "getManagedCollections (for reference resolution)",
         );
-        // Map Coda objectId (table ID) → Framer collection ID by finding collections whose
-        // items share the same Coda row IDs. We match by name as a heuristic: the Coda
-        // format.objectId is e.g. "grid-9Jw_2FoM_b" and we look for a Framer collection
-        // whose name matches the collectionName from the FramerSync config rows.
-        // Since we don't have that mapping here, we store it from allMappedFields:
-        // each lookup field carries codaRefTableId. We match against all managed collections
-        // by trying to find one whose items include IDs that came from that Coda table.
-        // Simpler: we match Framer collection name against a lookup in the payload config.
-        // For now, build a map of ALL managed collection IDs keyed by their Framer collection id
-        // so resolveReferenceFields can match codaRefTableId → framerCollectionId via
-        // a side-channel: we pass a map pre-populated from the payload's own collection mapping
-        // if available, otherwise skip.
-        // Build codaTableId → framerCollectionId map.
-        // Strategy: match via payload.collectionRefMap entries, which map
-        // Coda table IDs to Framer collection names (stable) rather than IDs (change on recreate).
+        // Skip the current collection itself
+        const otherCollections = allFramerCollections.filter(
+          (c) => c.id !== collectionHandle.id,
+        );
+
+        // Build codaRefTableId → framerCollectionId by finding which other Framer collection
+        // contains the item IDs referenced by each lookup field.
         const codaTableIdToFramerCollectionId = new Map();
-        if (Array.isArray(payload.collectionRefMap)) {
-          for (const entry of payload.collectionRefMap) {
-            if (!entry.codaTableId) continue;
-            let framerCollectionId = entry.framerCollectionId || null;
-            // If framerCollectionName is given, resolve to ID from the live collection list
-            if (!framerCollectionId && entry.framerCollectionName) {
-              const match = allFramerCollections.find(
-                (c) => c.name === entry.framerCollectionName,
+        const lookupFields = mappingResult.allMappedFields.filter((f) => f.type === "lookup");
+
+        for (const lookupField of lookupFields) {
+          if (codaTableIdToFramerCollectionId.has(lookupField.codaRefTableId)) continue;
+
+          // Collect a sample of ref IDs from the items for this field
+          const sampleIds = new Set();
+          for (const item of mappingResult.items) {
+            const val = item.fieldData?.[lookupField.id]?.value;
+            if (Array.isArray(val)) val.forEach((id) => sampleIds.add(id));
+            else if (typeof val === "string") sampleIds.add(val);
+            if (sampleIds.size >= 3) break;
+          }
+          if (sampleIds.size === 0) continue;
+
+          // Find which other collection contains at least one of those IDs
+          for (const otherCol of otherCollections) {
+            if (typeof otherCol.getItemIds !== "function") continue;
+            try {
+              const ids = await withTimeout(
+                otherCol.getItemIds(),
+                timeoutMs,
+                `getItemIds (ref resolution: ${otherCol.name})`,
               );
-              framerCollectionId = match?.id || null;
-            }
-            if (framerCollectionId) {
-              codaTableIdToFramerCollectionId.set(entry.codaTableId, framerCollectionId);
+              const idSet = new Set(Array.isArray(ids) ? ids.map(String) : []);
+              if ([...sampleIds].some((id) => idSet.has(id))) {
+                codaTableIdToFramerCollectionId.set(lookupField.codaRefTableId, otherCol.id);
+                eventLogger("info", "framer_sync", "Resolved reference field to collection", {
+                  field: lookupField.name,
+                  codaRefTableId: lookupField.codaRefTableId,
+                  framerCollectionId: otherCol.id,
+                  framerCollectionName: otherCol.name,
+                });
+                break;
+              }
+            } catch {
+              // skip unresolvable collections
             }
           }
         }
+
         const resolvedRefFields = resolveReferenceFields(
           mappingResult.allMappedFields,
           codaTableIdToFramerCollectionId,
