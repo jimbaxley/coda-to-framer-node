@@ -1,0 +1,9 @@
+{
+	"servers": {
+		"Framer-TeamUp": {
+			"url": "https://mcp.unframer.co/mcp?id=db0a28a2904a93d9452b8d38e19f316aaa22167cd9cb0f2be32db11c28300859&secret=kjs0eRQgjS2VdfcqRfCLlQqn7nyVJYU6",
+			"type": "http"
+		}
+	},
+	"inputs": []
+}
