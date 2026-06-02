@@ -541,6 +541,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         // Build codaRefTableId → framerCollectionId by finding which other Framer collection
         // contains the item IDs referenced by each lookup field.
         const codaTableIdToFramerCollectionId = new Map();
+        const codaFieldIdToFramerCollectionId = new Map();
 
         // If linkedCollectionName is provided, pre-seed all lookup fields with that collection.
         // This is the escape hatch for formula/computed lookup columns whose row values
@@ -550,7 +551,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
           const linkedCol = otherCollections.find((c) => String(c.name || "").toLowerCase() === linkedName);
           if (linkedCol) {
             for (const lf of mappingResult.allMappedFields.filter((f) => f.type === "lookup")) {
-              codaTableIdToFramerCollectionId.set(lf.codaRefTableId, linkedCol.id);
+              codaFieldIdToFramerCollectionId.set(lf.id, linkedCol.id);
             }
             eventLogger("info", "framer_sync", "Pre-seeded reference fields from linkedCollectionName", {
               linkedCollectionName: payload.linkedCollectionName,
@@ -566,7 +567,12 @@ async function executeSyncWorkflow(payload, eventLogger) {
         const lookupFields = mappingResult.allMappedFields.filter((f) => f.type === "lookup");
 
         for (const lookupField of lookupFields) {
-          if (codaTableIdToFramerCollectionId.has(lookupField.codaRefTableId)) continue;
+          if (
+            codaFieldIdToFramerCollectionId.has(lookupField.id) ||
+            codaTableIdToFramerCollectionId.has(lookupField.codaRefTableId)
+          ) {
+            continue;
+          }
 
           // Collect a sample of ref IDs from the items for this field
           const sampleIds = new Set();
@@ -626,6 +632,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         const resolvedRefFields = resolveReferenceFields(
           mappingResult.allMappedFields,
           codaTableIdToFramerCollectionId,
+          codaFieldIdToFramerCollectionId,
         );
         eventLogger("info", "framer_sync", "Reference fields resolved", {
           resolvedRefFields: resolvedRefFields.map((f) => ({ id: f.id, name: f.name, type: f.type, collectionId: f.collectionId })),
