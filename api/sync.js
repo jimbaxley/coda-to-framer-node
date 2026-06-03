@@ -255,6 +255,66 @@ function parseBooleanFlag(value, fallback = false) {
   return fallback;
 }
 
+function normalizeReferenceName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+async function buildLinkedCollectionReferenceMap({
+  columns,
+  linkedCollectionName,
+  framerProjectUrl,
+  framerApiKey,
+  eventLogger,
+}) {
+  const normalizedLinkedCollectionName = String(linkedCollectionName || "").trim();
+  if (!normalizedLinkedCollectionName) return new Map();
+
+  const collections = await listCollections(framerProjectUrl, framerApiKey);
+  const linkedCollection = collections.find(
+    (collection) => normalizeReferenceName(collection?.name) === normalizeReferenceName(normalizedLinkedCollectionName),
+  );
+
+  if (!linkedCollection?.id) {
+    eventLogger("warning", "reference_link", "Linked collection not found; reference fields left as strings", {
+      linkedCollectionName: normalizedLinkedCollectionName,
+    });
+    return new Map();
+  }
+
+  const linkedName = normalizeReferenceName(normalizedLinkedCollectionName);
+  const referenceMap = new Map();
+
+  columns.forEach((column) => {
+    const columnType = normalizeReferenceName(column?.format?.type);
+    if (columnType !== "lookup" && columnType !== "reference") return;
+
+    const referencedTable = column?.format?.table || {};
+    const referencedTableId = String(referencedTable.id || "").trim();
+    const referencedTableName = normalizeReferenceName(referencedTable.name || referencedTable.displayName);
+    if (!referencedTableId) return;
+
+    if (referencedTableName === linkedName || normalizeReferenceName(referencedTableId) === linkedName) {
+      referenceMap.set(referencedTableId, String(linkedCollection.id));
+    }
+  });
+
+  if (referenceMap.size === 0) {
+    eventLogger("warning", "reference_link", "No Coda reference fields matched linked collection; fields left as strings", {
+      linkedCollectionName: normalizedLinkedCollectionName,
+    });
+  } else {
+    eventLogger("info", "reference_link", "Enabled linked collection reference mapping", {
+      linkedCollectionName: normalizedLinkedCollectionName,
+      linkedCollectionId: linkedCollection.id,
+      referencedTables: Array.from(referenceMap.keys()),
+    });
+  }
+
+  return referenceMap;
+}
+
 async function provisionCallbackRowIfNeeded(payload, { requestId, jobId, vercelTrace }) {
   const callback = payload?.callback || {};
   const hasExplicitCallbackTable = Object.prototype.hasOwnProperty.call(callback, "statusTableIdOrName")
@@ -426,12 +486,20 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
     const columns = normalizeColumns(tableData.columns);
     const rows = normalizeRows(tableData.rows);
+    const referenceMap = await buildLinkedCollectionReferenceMap({
+      columns,
+      linkedCollectionName: payload.linkedCollectionName,
+      framerProjectUrl: payload.framerProjectUrl,
+      framerApiKey,
+      eventLogger,
+    });
 
     const mappingResult = buildFieldsAndItems({
       columns,
       rows,
       slugFieldId: resolvedSlugFieldId,
       use12HourTime: payload.use12HourTime !== false,
+      referenceMap,
     });
 
     return mappingResult;
