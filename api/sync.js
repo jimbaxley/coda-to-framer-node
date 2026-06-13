@@ -914,7 +914,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
   const hasExplicitCallbackTable = Object.prototype.hasOwnProperty.call(callback, "statusTableIdOrName")
     || Object.prototype.hasOwnProperty.call(callback, "statusTableInput");
   const defaultCallbackTableName = getDefaultCallbackTableName();
-  const rawStatusColumnNameOrId = callback.statusColumn || callback.statusColumnId || callback.statusColumnNameOrId || "Status";
+  const rawStatusColumnNameOrId = callback.statusColumn || callback.statusColumnId || callback.statusColumnNameOrId || "Server Status";
   const rawStatusRowSelector = callback.statusRow || callback.statusRowId || callback.statusRowSelector || payload.rowId || "";
   const rawStatusTableIdOrName = callback.statusTableIdOrName
     || callback.statusTableInput
