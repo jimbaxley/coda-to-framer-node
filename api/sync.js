@@ -1033,11 +1033,17 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     if (hasDedicatedMessageColumn) {
       cellsToUpdate.push({ column: resolvedMessageColumnId, value: message });
     }
-    for (const [columnName, value] of Object.entries(logValues)) {
-      const columnId = byLowerName.get(columnName.toLowerCase()) || "";
-      if (!columnId) continue;
-      if (columnId === resolvedStatusColumnId || columnId === resolvedMessageColumnId) continue;
-      cellsToUpdate.push({ column: columnId, value });
+    // Log values (job id, status, items added, etc.) are for dedicated sync
+    // log tables. Writing them to the source row (row-level sync) would
+    // corrupt workflow columns — e.g. "Status" in logValues = "published"
+    // would overwrite the Events table's workflow Status lookup column.
+    if (hasExplicitCallbackTable) {
+      for (const [columnName, value] of Object.entries(logValues)) {
+        const columnId = byLowerName.get(columnName.toLowerCase()) || "";
+        if (!columnId) continue;
+        if (columnId === resolvedStatusColumnId || columnId === resolvedMessageColumnId) continue;
+        cellsToUpdate.push({ column: columnId, value });
+      }
     }
 
     // Try to resolve an existing row if a selector was provided.
