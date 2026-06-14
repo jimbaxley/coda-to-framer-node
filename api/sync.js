@@ -452,34 +452,73 @@ async function executeSyncWorkflow(payload, eventLogger) {
     });
 
     let deleteCollection;
+    const deletePublishRequested = Boolean(payload.publish);
+    let deletePublishResult = null;
+    let deletePublishError = "";
+
     await runSyncSession(
       payload.framerProjectUrl,
       framerApiKey,
       payload.collectionName,
-      async ({ collectionHandle, collectionMeta, timeoutMs }) => {
+      async ({ framer, collectionHandle, collectionMeta, timeoutMs }) => {
         deleteCollection = collectionMeta;
         await withTimeout(
           collectionHandle.removeItems([framerItemId]),
           timeoutMs,
           "removeItem (deleteRow)",
         );
+
+        if (deletePublishRequested) {
+          eventLogger("info", "publishing", "Publishing project after deleteRow");
+          const publishTimeoutMs = getPublishTimeoutMs();
+          try {
+            let rawResult;
+            try {
+              rawResult = await withTimeout(framer.publish(), publishTimeoutMs, "publishProject");
+            } catch (error) {
+              const formatted = formatFramerError("publish", error);
+              throw new Error(formatted.message);
+            }
+            const deploymentId = rawResult?.deployment?.id || "";
+            if (!deploymentId) {
+              throw new Error("publish failed | missing deployment id in publish result");
+            }
+            try {
+              await withTimeout(framer.deploy(deploymentId), publishTimeoutMs, "deployProject");
+            } catch (error) {
+              const formatted = formatFramerError("deploy", error);
+              throw new Error(formatted.message);
+            }
+            deletePublishResult = { published: true, deploymentId };
+          } catch (error) {
+            deletePublishError = error instanceof Error ? error.message : String(error);
+            eventLogger("warning", "publishing", "Publish failed after deleteRow", { error: deletePublishError });
+          }
+        }
       },
     );
 
+    const deletePublishSucceeded = Boolean(deletePublishResult?.published);
+    const deleteName = normalizeSelectorValue(payload.rowId);
+    const deleteBaseMsg = `Removed "${deleteName}" from "${deleteCollection.collectionName}"`;
     return {
-      success: true,
+      success: !deletePublishRequested || deletePublishSucceeded,
       syncSuccess: true,
-      publishRequested: false,
+      publishRequested: deletePublishRequested,
       collectionId: deleteCollection.collectionId,
       collectionName: deleteCollection.collectionName,
       itemsAdded: 0,
       itemsRemoved: 1,
       fieldsSet: 0,
       warnings: [],
-      published: false,
-      publishError: "",
-      deploymentId: "",
-      message: `✅ Removed "${normalizeSelectorValue(payload.rowId)}" from "${deleteCollection.collectionName}".`,
+      published: deletePublishSucceeded,
+      publishError: deletePublishError,
+      deploymentId: deletePublishResult?.deploymentId ?? "",
+      message: deletePublishSucceeded
+        ? `✅ ${deleteBaseMsg} and published (${new Date().toISOString()}).`
+        : deletePublishRequested
+          ? `⚠️ ${deleteBaseMsg}, but publish failed: ${deletePublishError}`
+          : `✅ ${deleteBaseMsg}.`,
     };
   }
 
