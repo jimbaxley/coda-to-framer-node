@@ -460,7 +460,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
       payload.framerProjectUrl,
       framerApiKey,
       payload.collectionName,
-      async ({ framer, collectionHandle, collectionMeta, timeoutMs }) => {
+      async ({ framer, collection: collectionHandle, collectionMeta, timeoutMs }) => {
         deleteCollection = collectionMeta;
         await withTimeout(
           collectionHandle.removeItems([framerItemId]),
