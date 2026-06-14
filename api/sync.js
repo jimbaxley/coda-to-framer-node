@@ -9,6 +9,8 @@ import {
   updateTableCell,
   updateTableRowCells,
   createTableRow,
+  resolveBaseTableId,
+  getCodaTableDataPaginated,
 } from "../lib/coda-client.js";
 import {
   normalizeColumns,
@@ -357,9 +359,20 @@ async function provisionCallbackRowIfNeeded(payload, { requestId, jobId, vercelT
   }
 
   try {
-    const resolvedStatusTableId = await resolveTableNameOrId(
+    const resolvedTableRef = await resolveTableNameOrId(
       statusDocId,
       statusTableIdOrName,
+      codaApiToken,
+    );
+
+    // Write status to the underlying base table. When the callback target is a
+    // filtered view, the source row may no longer pass the filter (e.g. a row
+    // just removed from a "ready to publish" view by deleteRow). Searching the
+    // view would miss it and autocreate a duplicate; the base table always
+    // contains it, and updates there are reflected in the view.
+    const resolvedStatusTableId = await resolveBaseTableId(
+      statusDocId,
+      resolvedTableRef,
       codaApiToken,
     );
 
@@ -415,30 +428,44 @@ async function executeSyncWorkflow(payload, eventLogger) {
       ),
     };
 
+    // A row being deleted has usually dropped out of any filtered/published
+    // view, so resolve the underlying base table and search there. This
+    // mirrors SyncRowToFramer's row-finding (getCodaTableData + findRowBySelector)
+    // — which strips Coda's rich-text backtick wrappers and matches by slug or
+    // API row id — but reads every page and targets the base table.
+    const deleteSearchTableId = await resolveBaseTableId(
+      payload.docId,
+      payload.tableIdOrName,
+      codaApiToken,
+      deleteReadOptions,
+    );
+
     let resolvedSlugFieldId = payload.slugFieldId;
     if (payload.slugFieldId) {
       resolvedSlugFieldId = await resolveColumnNameOrId(
         payload.docId,
-        payload.tableIdOrName,
+        deleteSearchTableId,
         payload.slugFieldId,
         codaApiToken,
         deleteReadOptions,
       );
     }
 
-    eventLogger("info", "extract", "Fetching Coda table to resolve row ID for deleteRow", {
+    eventLogger("info", "extract", "Searching Coda table for row by slug (deleteRow)", {
       tableIdOrName: payload.tableIdOrName,
+      searchTableId: deleteSearchTableId,
+      rowId: payload.rowId,
     });
 
-    const deleteTableData = await getCodaTableData(
+    const deleteTableData = await getCodaTableDataPaginated(
       payload.docId,
-      payload.tableIdOrName,
+      deleteSearchTableId,
       codaApiToken,
-      500,
       deleteReadOptions,
     );
 
     const matchedRow = findRowBySelector(deleteTableData, payload.rowId, resolvedSlugFieldId);
+
     if (!matchedRow?.id) {
       throw new Error(
         `Row not found for selector "${normalizeSelectorValue(payload.rowId)}". Cannot determine Framer item ID for deleteRow.`,
@@ -1098,9 +1125,20 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
   }
 
   try {
-    const resolvedStatusTableId = await resolveTableNameOrId(
+    const resolvedTableRef = await resolveTableNameOrId(
       statusDocId,
       statusTableIdOrName,
+      codaApiToken,
+    );
+
+    // Write status to the underlying base table. When the callback target is a
+    // filtered view, the source row may no longer pass the filter (e.g. a row
+    // just removed from a "ready to publish" view by deleteRow). Searching the
+    // view would miss it and autocreate a duplicate; the base table always
+    // contains it, and updates there are reflected in the view.
+    const resolvedStatusTableId = await resolveBaseTableId(
+      statusDocId,
+      resolvedTableRef,
       codaApiToken,
     );
 
