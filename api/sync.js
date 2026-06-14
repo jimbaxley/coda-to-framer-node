@@ -1149,6 +1149,29 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       codaApiToken,
     );
 
+    // Distinguish a dedicated sync-log table from a write-back to the source
+    // row. deleteRow (and row-level sync) write status onto the source row, so
+    // the callback table resolves to the same base table as payload.tableIdOrName.
+    // In that case we must NOT splatter log values (Job id, Status, Items
+    // added, ...) onto the row — e.g. logValues.Status = "completed" would
+    // overwrite the workflow Status column. Only a separate log table should
+    // receive them.
+    let sourceBaseTableId = "";
+    if (payload.tableIdOrName) {
+      try {
+        sourceBaseTableId = await resolveBaseTableId(
+          statusDocId,
+          payload.tableIdOrName,
+          codaApiToken,
+        );
+      } catch (_) {
+        sourceBaseTableId = "";
+      }
+    }
+    const isDedicatedLogTable = hasExplicitCallbackTable
+      && Boolean(sourceBaseTableId)
+      && resolvedStatusTableId !== sourceBaseTableId;
+
     // Precompute table columns and the full set of log cells so we can create
     // a single, complete log row if needed (avoids partial/duplicate rows).
     const tableColumns = await getCodaTableColumns(
@@ -1192,10 +1215,10 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       cellsToUpdate.push({ column: resolvedMessageColumnId, value: message });
     }
     // Log values (job id, status, items added, etc.) are for dedicated sync
-    // log tables. Writing them to the source row (row-level sync) would
-    // corrupt workflow columns — e.g. "Status" in logValues = "published"
+    // log tables. Writing them to the source row (row-level sync / deleteRow)
+    // would corrupt workflow columns — e.g. "Status" in logValues = "published"
     // would overwrite the Events table's workflow Status lookup column.
-    if (hasExplicitCallbackTable) {
+    if (isDedicatedLogTable) {
       for (const [columnName, value] of Object.entries(logValues)) {
         const columnId = byLowerName.get(columnName.toLowerCase()) || "";
         if (!columnId) continue;
