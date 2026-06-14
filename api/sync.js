@@ -402,6 +402,87 @@ async function executeSyncWorkflow(payload, eventLogger) {
     throw new Error("Missing Framer API key");
   }
 
+  const isDeleteRow = payload.action === "deleteRow";
+  if (isDeleteRow) {
+    if (!payload.rowId) {
+      throw new Error("Missing required field for deleteRow: rowId");
+    }
+
+    const deleteReadOptions = {
+      requireLatest: parseBooleanFlag(
+        payload.requireLatestCodaSnapshot ?? process.env.CODA_REQUIRE_LATEST_SOURCE_READS,
+        false,
+      ),
+    };
+
+    let resolvedSlugFieldId = payload.slugFieldId;
+    if (payload.slugFieldId) {
+      resolvedSlugFieldId = await resolveColumnNameOrId(
+        payload.docId,
+        payload.tableIdOrName,
+        payload.slugFieldId,
+        codaApiToken,
+        deleteReadOptions,
+      );
+    }
+
+    eventLogger("info", "extract", "Fetching Coda table to resolve row ID for deleteRow", {
+      tableIdOrName: payload.tableIdOrName,
+    });
+
+    const deleteTableData = await getCodaTableData(
+      payload.docId,
+      payload.tableIdOrName,
+      codaApiToken,
+      500,
+      deleteReadOptions,
+    );
+
+    const matchedRow = findRowBySelector(deleteTableData, payload.rowId, resolvedSlugFieldId);
+    if (!matchedRow?.id) {
+      throw new Error(
+        `Row not found for selector "${normalizeSelectorValue(payload.rowId)}". Cannot determine Framer item ID for deleteRow.`,
+      );
+    }
+
+    const framerItemId = matchedRow.id;
+    eventLogger("info", "framer_delete", "Resolved Framer item ID for deleteRow", {
+      rowSelector: payload.rowId,
+      framerItemId,
+    });
+
+    let deleteCollection;
+    await runSyncSession(
+      payload.framerProjectUrl,
+      framerApiKey,
+      payload.collectionName,
+      async ({ collectionHandle, collectionMeta, timeoutMs }) => {
+        deleteCollection = collectionMeta;
+        await withTimeout(
+          collectionHandle.removeItems([framerItemId]),
+          timeoutMs,
+          "removeItem (deleteRow)",
+        );
+      },
+    );
+
+    return {
+      success: true,
+      syncSuccess: true,
+      publishRequested: false,
+      collectionId: deleteCollection.collectionId,
+      collectionName: deleteCollection.collectionName,
+      itemsAdded: 0,
+      itemsRemoved: 1,
+      fieldsSet: 0,
+      warnings: [],
+      published: false,
+      publishError: "",
+      deploymentId: "",
+      message: `✅ Removed "${normalizeSelectorValue(payload.rowId)}" from "${deleteCollection.collectionName}".`,
+    };
+  }
+
   const isRowSync = payload.action === "rowSync" || Boolean(payload.rowId);
   if (isRowSync && !payload.rowId) {
     throw new Error("Missing required field for rowSync: rowId");
@@ -836,7 +917,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
     publishError,
     deploymentId: publishResult?.deploymentId ?? "",
     message: publishSucceeded
-      ? `✅ ${baseSyncMessage} and published (deployment: ${publishResult.deploymentId}).`
+      ? `✅ ${baseSyncMessage} and published (${new Date().toISOString()}).`
       : publishRequested
         ? `⚠️ ${baseSyncMessage}, but publish failed: ${publishError}`
         : `✅ ${baseSyncMessage}.`,
@@ -1395,6 +1476,10 @@ function validateSyncPayload(payload) {
     if (!payload[field]) {
       return `Missing required field: ${field}`;
     }
+  }
+
+  if (payload.action === "deleteRow" && !payload.rowId) {
+    return "Missing required field for deleteRow: rowId";
   }
 
   if (!process.env.CODA_API_TOKEN) {
