@@ -8,6 +8,23 @@ Supports both full-table sync and single-row sync.
 
 - `CODA_API_TOKEN` - Coda API token with access to the source doc
 - `FRAMER_API_KEY` - Framer Server API key
+- `CONVEX_SITE_URL` - Convex HTTP actions URL for event staging (TeamUP NC dev: `https://oceanic-greyhound-532.convex.site`)
+- `CONVEX_EVENTS_UPSERT_PATH` - Convex event upsert endpoint path (default: `/coda/events/upsert`)
+- `CODA_SYNC_SECRET` - bearer token shared with the Convex `CODA_SYNC_SECRET` env var
+- `CONVEX_SYNC_ENABLED` - set to `false` to skip Convex staging for row syncs (default: `true`)
+
+Optional Convex field mapping overrides:
+
+- `CONVEX_EVENT_TITLE_FIELD` - Coda column name for event title when not `Title`, `Event Title`, `Name`, or `Event Name`
+- `CONVEX_EVENT_STARTS_AT_FIELD` - Coda column name for event start date/time
+- `CONVEX_EVENT_ENDS_AT_FIELD` - Coda column name for event end date/time
+- `CONVEX_EVENT_LOCATION_FIELD` - Coda column name for location
+- `CONVEX_EVENT_DESCRIPTION_FIELD` - Coda column name for description/details
+- `CONVEX_EVENT_CAPACITY_FIELD` - Coda column name for capacity
+- `CONVEX_EVENT_STATUS_FIELD` - Coda column name for Coda workflow status; stored as `codaStatus` and normalized to the app lifecycle `status`
+- `CONVEX_EVENT_LIVE_FIELD` - Coda boolean column controlling Framer eligibility (default candidates: `Live`, `Is Live`, `Published`, `Public`, `Publish`, `Ready`)
+- `CONVEX_EVENT_TAGS_FIELD` - Coda column name for tags/categories
+- `CONVEX_EVENT_EA_ID_FIELD` - Coda column name for EveryAction event ID
 
 Optional retry/fallback tuning:
 
@@ -105,6 +122,11 @@ Status endpoint:
 
 - If `rowId` is provided (or `action` is `rowSync`), the API fetches and syncs only that row. `rowId` may be an API row ID (`i-...`) or a unique slug selector value from `slugFieldId`.
 - Otherwise, it performs table sync using `rowLimit`.
+- All mapped rows are staged to Convex first when `CONVEX_SYNC_ENABLED` is true.
+- Rows are kept in Convex regardless of Framer eligibility.
+- Framer receives only rows where the Coda live field is true and Coda status is not `Completed`.
+- Rows with Coda status `Completed` are kept in Convex with `status: "completed"` and `publishToFramer: false`.
+- Completed or non-live rows are not added to Framer. During full-table sync with `deleteMissing: true`, those rows are removed from Framer because they are omitted from the Framer item snapshot.
 - For table sync, set `deleteMissing: true` to remove managed collection items that are no longer present in the Coda table snapshot.
 - When Coda returns transient empty slug values during recent UI edits, the handler retries Coda snapshot/mapping before returning warnings.
 - `initialDelayMs` (or env default `CODA_INITIAL_DELAY_MS`) is applied before extract to mitigate Coda UI/API propagation lag.

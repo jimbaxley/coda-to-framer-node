@@ -25,6 +25,10 @@ import {
   formatFramerError,
   getPublishTimeoutMs,
 } from "../lib/framer-client.js";
+import {
+  shouldPublishItemToFramer,
+  upsertEventsToConvex,
+} from "../lib/convex-client.js";
 
 function normalizeCollectionFieldsLocal(fields) {
   return (Array.isArray(fields) ? fields : [])
@@ -473,6 +477,22 @@ async function executeSyncWorkflow(payload, eventLogger) {
     }
 
     const framerItemId = matchedRow.id;
+    const deleteColumns = normalizeColumns(deleteTableData.columns);
+    const deleteRows = normalizeRows([matchedRow]);
+    const deleteMappingResult = buildFieldsAndItems({
+      columns: deleteColumns,
+      rows: deleteRows,
+      slugFieldId: resolvedSlugFieldId,
+      use12HourTime: payload.use12HourTime !== false,
+    });
+    const deleteConvexResult = parseBooleanFlag(payload.bypassConvex)
+      ? { skipped: true, count: 0, results: [] }
+      : await upsertEventsToConvex({
+        payload,
+        mappingResult: deleteMappingResult,
+        eventLogger,
+      });
+
     eventLogger("info", "framer_delete", "Resolved Framer item ID for deleteRow", {
       rowSelector: payload.rowId,
       framerItemId,
@@ -531,6 +551,9 @@ async function executeSyncWorkflow(payload, eventLogger) {
     return {
       success: !deletePublishRequested || deletePublishSucceeded,
       syncSuccess: true,
+      convexSynced: Boolean(deleteConvexResult && !deleteConvexResult.skipped),
+      convexSyncedCount: deleteConvexResult?.count || 0,
+      convexEventId: deleteConvexResult?.results?.[0]?.response?.eventId || "",
       publishRequested: deletePublishRequested,
       collectionId: deleteCollection.collectionId,
       collectionName: deleteCollection.collectionName,
@@ -542,10 +565,10 @@ async function executeSyncWorkflow(payload, eventLogger) {
       publishError: deletePublishError,
       deploymentId: deletePublishResult?.deploymentId ?? "",
       message: deletePublishSucceeded
-        ? `✅ ${deleteBaseMsg} and published (${new Date().toISOString()}).`
+        ? `✅ Saved ${deleteConvexResult?.count || 0} to Convex. ${deleteBaseMsg} and published (${new Date().toISOString()}).`
         : deletePublishRequested
-          ? `⚠️ ${deleteBaseMsg}, but publish failed: ${deletePublishError}`
-          : `✅ ${deleteBaseMsg}.`,
+          ? `⚠️ Saved ${deleteConvexResult?.count || 0} to Convex. ${deleteBaseMsg}, but Framer publish failed: ${deletePublishError}`
+          : `✅ Saved ${deleteConvexResult?.count || 0} to Convex. ${deleteBaseMsg}.`,
     };
   }
 
@@ -692,6 +715,27 @@ async function executeSyncWorkflow(payload, eventLogger) {
     collectionName: payload.collectionName,
   });
 
+  const convexResult = parseBooleanFlag(payload.bypassConvex)
+    ? { skipped: true, count: 0, results: [] }
+    : await upsertEventsToConvex({
+      payload,
+      mappingResult,
+      eventLogger,
+    });
+  const framerItems = mappingResult.items.filter((item) =>
+    shouldPublishItemToFramer({ payload, mappingResult, item }),
+  );
+  const skippedFramerItems = mappingResult.items.length - framerItems.length;
+  if (skippedFramerItems > 0) {
+    eventLogger("info", "framer_sync", "Skipping completed item(s) for Framer", {
+      skippedFramerItems,
+    });
+  }
+  const framerMappingResult = {
+    ...mappingResult,
+    items: framerItems,
+  };
+
   let collection;
   let fieldsSet = 0;
   let itemsRemoved = 0;
@@ -735,7 +779,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
       // Set fields
       if (!isRowSync || collection.created) {
-        const compatibleFields = mappingResult.fields.filter(Boolean);
+        const compatibleFields = framerMappingResult.fields.filter(Boolean);
         await withTimeout(
           collectionHandle.setFields(compatibleFields),
           timeoutMs,
@@ -781,7 +825,27 @@ async function executeSyncWorkflow(payload, eventLogger) {
         throw lastError;
       }
 
-      if (mappingResult.items.length > 0) {
+      if (isRowSync && mappingResult.items.length > 0 && framerMappingResult.items.length === 0) {
+        const itemId = String(mappingResult.items[0]?.id || "");
+        if (itemId) {
+          try {
+            await withTimeout(
+              collectionHandle.removeItems([itemId]),
+              timeoutMs,
+              "removeCompletedItemFromCollection (rowSync)",
+            );
+            itemsRemoved = 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            eventLogger("warning", "framer_sync", "Completed item was not removed from Framer", {
+              itemId,
+              message,
+            });
+          }
+        }
+      }
+
+      if (framerMappingResult.items.length > 0) {
         // Fetch existing item IDs before add
         let existingItemIds = [];
         try {
@@ -800,7 +864,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
         // Fetch collection fields for remapping (use object fields first, fall back to getFields)
         const codaFieldIdToName = new Map(
-          mappingResult.fields.map((field) => [field.id, field.name]),
+          framerMappingResult.fields.map((field) => [field.id, field.name]),
         );
 
         async function fetchFields() {
@@ -832,7 +896,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
           });
         }
 
-        let itemsToAdd = remapItems(mappingResult.items);
+        let itemsToAdd = remapItems(framerMappingResult.items);
 
         // Add items with one retry on field-not-found after schema refresh
         let addItemsAttempted = false;
@@ -856,7 +920,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
               collectionFieldNameToId = new Map(
                 collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
               );
-              itemsToAdd = remapItems(mappingResult.items);
+              itemsToAdd = remapItems(framerMappingResult.items);
               continue;
             } else {
               throw err;
@@ -868,7 +932,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         // rowSync path: filter to known field IDs and add again
         if (isRowSync && !collection.created) {
           const allowedFieldIds = new Set(collectionFields.map((f) => f.id));
-          itemsToAdd = mappingResult.items.map((item) => {
+          itemsToAdd = framerMappingResult.items.map((item) => {
             const filteredFieldData = {};
             for (const [fieldId, fieldValue] of Object.entries(item?.fieldData || {})) {
               if (allowedFieldIds.has(fieldId)) filteredFieldData[fieldId] = fieldValue;
@@ -905,7 +969,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
       // Delete missing items
       if (!isRowSync && payload.deleteMissing) {
-        const codaItemIds = new Set(mappingResult.items.map((item) => String(item.id)));
+        const codaItemIds = new Set(framerMappingResult.items.map((item) => String(item.id)));
         let managedItemIds = [];
         if (typeof collectionHandle.getItemIds === "function") {
           managedItemIds = await fetchItemIds("getManagedCollectionItemIds (deleteMissing)");
@@ -966,16 +1030,23 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
   const publishSucceeded = Boolean(publishResult?.published);
   const overallSuccess = !publishRequested || publishSucceeded;
-  const itemSummary = `${mappingResult.items.length} item${mappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""}`;
+  const itemSummary = `${framerMappingResult.items.length} Framer item${framerMappingResult.items.length === 1 ? "" : "s"}${itemsRemoved > 0 ? `, removed ${itemsRemoved}` : ""}`;
   const baseSyncMessage = `Synced ${itemSummary} to "${collection.collectionName}"`;
+  const convexSaved = Boolean(convexResult && !convexResult.skipped);
+  const convexPrefix = convexSaved
+    ? `Saved ${convexResult.count || 0} to Convex. `
+    : "";
 
   const responseBody = {
     success: overallSuccess,
     syncSuccess: true,
+    convexSynced: convexSaved,
+    convexSyncedCount: convexResult?.count || 0,
+    convexEventId: convexResult?.results?.[0]?.response?.eventId || "",
     publishRequested,
     collectionId: collection.collectionId,
     collectionName: collection.collectionName,
-    itemsAdded: mappingResult.items.length,
+    itemsAdded: framerMappingResult.items.length,
     itemsRemoved,
     fieldsSet,
     warnings: mappingResult.warnings,
@@ -983,10 +1054,10 @@ async function executeSyncWorkflow(payload, eventLogger) {
     publishError,
     deploymentId: publishResult?.deploymentId ?? "",
     message: publishSucceeded
-      ? `✅ ${baseSyncMessage} and published (${new Date().toISOString()}).`
+      ? `✅ ${convexPrefix}${baseSyncMessage} and published (${new Date().toISOString()}).`
       : publishRequested
-        ? `⚠️ ${baseSyncMessage}, but publish failed: ${publishError}`
-        : `✅ ${baseSyncMessage}.`,
+        ? `⚠️ ${convexPrefix}${baseSyncMessage}, but Framer publish failed: ${publishError}`
+        : `✅ ${convexPrefix}${baseSyncMessage}. Framer publish queued only when requested.`,
   };
 
   return responseBody;
