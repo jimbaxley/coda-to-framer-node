@@ -1205,6 +1205,73 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     const logValues = buildCallbackLogValues(jobData, message);
     const statusValue = String(jobData?.status || "").trim() || message;
     const hasDedicatedMessageColumn = Boolean(resolvedMessageColumnId && resolvedMessageColumnId !== resolvedStatusColumnId);
+    const sourceStatusColumnInput = callback.sourceStatusColumnId || callback.sourceStatusColumn || "";
+
+    const writeSourceStatusMirror = async () => {
+      if (!isDedicatedLogTable || !sourceStatusColumnInput || !payload.tableIdOrName || !payload.rowId) {
+        return;
+      }
+
+      const sourceStatusColumnId = await resolveColumnNameOrId(
+        statusDocId,
+        sourceBaseTableId,
+        sourceStatusColumnInput,
+        codaApiToken,
+      );
+
+      let sourceRowId = "";
+      const sourceRowSelector = String(payload.rowId || "").trim();
+      if (isApiRowId(sourceRowSelector)) {
+        sourceRowId = sourceRowSelector;
+      } else {
+        let sourceSlugFieldId = payload.slugFieldId || "";
+        if (sourceSlugFieldId) {
+          sourceSlugFieldId = await resolveColumnNameOrId(
+            statusDocId,
+            sourceBaseTableId,
+            sourceSlugFieldId,
+            codaApiToken,
+          );
+        }
+
+        const sourceTableData = await getCodaTableData(
+          statusDocId,
+          sourceBaseTableId,
+          codaApiToken,
+          callback.sourceStatusRowSearchLimit ?? 500,
+        );
+        const matchedSourceRow = findRowBySelector(
+          sourceTableData,
+          sourceRowSelector,
+          sourceSlugFieldId,
+        );
+        sourceRowId = matchedSourceRow?.id || "";
+      }
+
+      if (!sourceRowId) {
+        eventLogger("warning", "callback", "Skipped source status mirror: source row not found", {
+          sourceTableIdOrName: sourceBaseTableId,
+          sourceRowSelector,
+          sourceStatusColumnInput,
+        });
+        return;
+      }
+
+      await updateTableCell(
+        statusDocId,
+        sourceBaseTableId,
+        sourceRowId,
+        sourceStatusColumnId,
+        message,
+        codaApiToken,
+      );
+      eventLogger("info", "callback", "Updated source status mirror", {
+        sourceTableIdOrName: sourceBaseTableId,
+        sourceRowSelector,
+        sourceRowId,
+        sourceStatusColumnInput,
+      });
+    };
 
     const cellsToUpdate = [];
     cellsToUpdate.push({
@@ -1299,6 +1366,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // issuing additional updates immediately afterwards is what was blowing
     // Coda’s rate limit when a row is autocreated during a sync.
     if (rowWasCreatedHere) {
+      await writeSourceStatusMirror();
       eventLogger("info", "callback", "Callback row just created; skipping follow-on updates");
       return;
     }
@@ -1425,6 +1493,8 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       // surface the fact so that the job event contains the detail.
       throw lastRowUpdateError instanceof Error ? lastRowUpdateError : new Error(String(lastRowUpdateError));
     }
+
+    await writeSourceStatusMirror();
   } catch (error) {
     const callbackError = error instanceof Error ? error.message : String(error);
     eventLogger("warning", "callback", "Failed to update Coda status cell", {
