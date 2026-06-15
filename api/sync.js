@@ -1212,65 +1212,74 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
         return;
       }
 
-      const sourceStatusColumnId = await resolveColumnNameOrId(
-        statusDocId,
-        sourceBaseTableId,
-        sourceStatusColumnInput,
-        codaApiToken,
-      );
-
-      let sourceRowId = "";
-      const sourceRowSelector = String(payload.rowId || "").trim();
-      if (isApiRowId(sourceRowSelector)) {
-        sourceRowId = sourceRowSelector;
-      } else {
-        let sourceSlugFieldId = payload.slugFieldId || "";
-        if (sourceSlugFieldId) {
-          sourceSlugFieldId = await resolveColumnNameOrId(
-            statusDocId,
-            sourceBaseTableId,
-            sourceSlugFieldId,
-            codaApiToken,
-          );
-        }
-
-        const sourceTableData = await getCodaTableData(
+      try {
+        const sourceStatusColumnId = await resolveColumnNameOrId(
           statusDocId,
           sourceBaseTableId,
+          sourceStatusColumnInput,
           codaApiToken,
-          callback.sourceStatusRowSearchLimit ?? 500,
         );
-        const matchedSourceRow = findRowBySelector(
-          sourceTableData,
-          sourceRowSelector,
-          sourceSlugFieldId,
-        );
-        sourceRowId = matchedSourceRow?.id || "";
-      }
 
-      if (!sourceRowId) {
-        eventLogger("warning", "callback", "Skipped source status mirror: source row not found", {
+        let sourceRowId = "";
+        const sourceRowSelector = String(payload.rowId || "").trim();
+        if (isApiRowId(sourceRowSelector)) {
+          sourceRowId = sourceRowSelector;
+        } else {
+          let sourceSlugFieldId = payload.slugFieldId || "";
+          if (sourceSlugFieldId) {
+            sourceSlugFieldId = await resolveColumnNameOrId(
+              statusDocId,
+              sourceBaseTableId,
+              sourceSlugFieldId,
+              codaApiToken,
+            );
+          }
+
+          const sourceTableData = await getCodaTableData(
+            statusDocId,
+            sourceBaseTableId,
+            codaApiToken,
+            callback.sourceStatusRowSearchLimit ?? 500,
+          );
+          const matchedSourceRow = findRowBySelector(
+            sourceTableData,
+            sourceRowSelector,
+            sourceSlugFieldId,
+          );
+          sourceRowId = matchedSourceRow?.id || "";
+        }
+
+        if (!sourceRowId) {
+          eventLogger("warning", "callback", "Skipped source status mirror: source row not found", {
+            sourceTableIdOrName: sourceBaseTableId,
+            sourceRowSelector,
+            sourceStatusColumnInput,
+          });
+          return;
+        }
+
+        await updateTableCell(
+          statusDocId,
+          sourceBaseTableId,
+          sourceRowId,
+          sourceStatusColumnId,
+          message,
+          codaApiToken,
+        );
+        eventLogger("info", "callback", "Updated source status mirror", {
           sourceTableIdOrName: sourceBaseTableId,
           sourceRowSelector,
+          sourceRowId,
           sourceStatusColumnInput,
         });
-        return;
+      } catch (mirrorError) {
+        eventLogger("warning", "callback", "Failed to update source status mirror", {
+          mirrorError: mirrorError instanceof Error ? mirrorError.message : String(mirrorError),
+          sourceTableIdOrName: sourceBaseTableId,
+          sourceRowSelector: String(payload.rowId || "").trim(),
+          sourceStatusColumnInput,
+        });
       }
-
-      await updateTableCell(
-        statusDocId,
-        sourceBaseTableId,
-        sourceRowId,
-        sourceStatusColumnId,
-        message,
-        codaApiToken,
-      );
-      eventLogger("info", "callback", "Updated source status mirror", {
-        sourceTableIdOrName: sourceBaseTableId,
-        sourceRowSelector,
-        sourceRowId,
-        sourceStatusColumnInput,
-      });
     };
 
     const cellsToUpdate = [];
