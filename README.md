@@ -4,31 +4,23 @@ Node backend for syncing Coda tables to Framer managed collections using the `fr
 
 Supports both full-table sync and single-row sync.
 
-## Row payload sync
+## Row Freshness Anchors
 
-For row-level pushes triggered from Coda buttons, the worker can skip the Coda API snapshot and use a typed row payload supplied by the Pack. This avoids the lag where Coda's API may return a stale value immediately after a row edit.
-
-Set these payload fields on a normal `rowSync` request:
+For row-level syncs triggered immediately after a Coda edit, the request may include a freshness anchor. The worker rereads the Coda API row until the configured column matches the expected current value, then runs the normal mapping/write/publish flow.
 
 ```json
 {
   "action": "rowSync",
-  "useRowPayload": true,
-  "rowPayloadJson": "{\"id\":\"i-row\",\"rowId\":\"i-row\",\"slug\":\"event-slug\",\"values\":{\"Title\":{\"id\":\"title\",\"type\":\"text\",\"value\":\"Fresh title\"}}}"
+  "freshness": {
+    "columnIdOrName": "Title",
+    "expectedValue": "Fresh title from thisRow",
+    "maxAttempts": 5,
+    "delayMs": 1500
+  }
 }
 ```
 
-Payload values should be typed objects:
-
-```json
-{
-  "Title": { "id": "title", "type": "text", "value": "Fresh title" },
-  "Start Date": { "id": "start_date", "type": "date", "value": "2026-06-19T15:30:00.000Z" },
-  "Live": { "id": "live", "type": "checkbox", "value": true }
-}
-```
-
-The payload is normalized into the same Coda-like `columns + rows` shape used by the existing mapper, so date, rich text, link, image, file, number, boolean, select-list stringification, and multi-reference conversion stay centralized in `lib/mapping.js`.
+If the value does not match before `maxAttempts`, the job fails before writing to Framer. This is intentionally strict so stale Coda snapshots are not published.
 
 ## Environment Variables
 

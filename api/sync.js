@@ -29,10 +29,6 @@ import {
   shouldPublishItemToFramer,
   upsertEventsToConvex,
 } from "../lib/convex-client.js";
-import {
-  buildCodaLikeTableDataFromRowPayload,
-  buildReferenceMapFromRowPayload,
-} from "../lib/row-payload.js";
 
 function normalizeCollectionFieldsLocal(fields) {
   return (Array.isArray(fields) ? fields : [])
@@ -265,20 +261,57 @@ function parseBooleanFlag(value, fallback = false) {
   return fallback;
 }
 
-function getRowPayloadFromSyncPayload(payload) {
-  if (payload.rowPayload && typeof payload.rowPayload === "object") {
-    return payload.rowPayload;
+function normalizeFreshnessValue(value) {
+  if (value === null || value === undefined) return "";
+
+  if (Array.isArray(value)) {
+    return value.map(normalizeFreshnessValue).filter(Boolean).join(", ");
   }
 
-  const rowPayloadJson = String(payload.rowPayloadJson || "").trim();
-  if (!rowPayloadJson) return null;
-
-  try {
-    return JSON.parse(rowPayloadJson);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`rowPayloadJson is not valid JSON: ${message}`);
+  if (value instanceof Date) {
+    return value.toISOString();
   }
+
+  if (typeof value === "object") {
+    const obj = value;
+    const candidates = [
+      obj.value,
+      obj.displayValue,
+      obj.name,
+      obj.rawValue,
+      obj.url,
+      obj.rowId,
+      obj.id,
+    ];
+    for (const candidate of candidates) {
+      const normalized = normalizeFreshnessValue(candidate);
+      if (normalized) return normalized;
+    }
+    return JSON.stringify(value);
+  }
+
+  return String(value).trim();
+}
+
+function getFreshnessValue(tableData, columnId, columnIdOrName) {
+  const normalizedColumnId = String(columnId || "").trim();
+  const normalizedInput = String(columnIdOrName || "").trim().toLowerCase();
+  const column = (tableData.columns || []).find((candidate) => {
+    const id = String(candidate?.id || "").trim();
+    const name = String(candidate?.name || "").trim();
+    return (
+      (normalizedColumnId && id === normalizedColumnId)
+      || id.toLowerCase() === normalizedInput
+      || name.toLowerCase() === normalizedInput
+    );
+  });
+  const columnName = column?.name || String(columnIdOrName || "");
+  const row = (tableData.rows || [])[0] || {};
+  const value = row?.values?.[columnName];
+  return {
+    columnName,
+    actual: normalizeFreshnessValue(value),
+  };
 }
 
 function normalizeReferenceName(value) {
@@ -597,12 +630,6 @@ async function executeSyncWorkflow(payload, eventLogger) {
     throw new Error("Missing required field for rowSync: rowId");
   }
 
-  const useRowPayload = isRowSync && parseBooleanFlag(payload.useRowPayload, false);
-  const rowPayload = useRowPayload ? getRowPayloadFromSyncPayload(payload) : null;
-  if (useRowPayload && !rowPayload) {
-    throw new Error("useRowPayload is true, but rowPayloadJson/rowPayload was not provided.");
-  }
-
   let resolvedSlugFieldId = payload.slugFieldId;
   const codaReadOptions = {
     requireLatest: parseBooleanFlag(
@@ -610,12 +637,32 @@ async function executeSyncWorkflow(payload, eventLogger) {
       false,
     ),
   };
+  const freshness = payload.freshness && typeof payload.freshness === "object"
+    ? payload.freshness
+    : {};
+  const freshnessColumnIdOrName = String(freshness.columnIdOrName || payload.freshnessColumnIdOrName || "").trim();
+  const freshnessExpectedValue = normalizeFreshnessValue(
+    "expectedValue" in freshness ? freshness.expectedValue : payload.freshnessExpectedValue,
+  );
+  const hasFreshnessAnchor = isRowSync && Boolean(freshnessColumnIdOrName);
+  const freshnessMaxAttempts = parseIntEnv(
+    freshness.maxAttempts ?? payload.freshnessMaxAttempts ?? process.env.CODA_FRESHNESS_RETRY_ATTEMPTS ?? 5,
+    5,
+    1,
+    20,
+  );
+  const freshnessDelayMs = parseIntEnv(
+    freshness.delayMs ?? payload.freshnessDelayMs ?? process.env.CODA_FRESHNESS_RETRY_DELAY_MS ?? 1500,
+    1500,
+    0,
+    30000,
+  );
   eventLogger("info", "extract", "Configured Coda snapshot read mode", {
     requireLatest: codaReadOptions.requireLatest,
-    useRowPayload,
+    hasFreshnessAnchor,
   });
 
-  if (!useRowPayload && payload.slugFieldId) {
+  if (payload.slugFieldId) {
     resolvedSlugFieldId = await resolveColumnNameOrId(
       payload.docId,
       payload.tableIdOrName,
@@ -631,11 +678,26 @@ async function executeSyncWorkflow(payload, eventLogger) {
     }
   }
 
-  const getCodaSnapshot = async () => {
+  let resolvedFreshnessColumnId = freshnessColumnIdOrName;
+  if (hasFreshnessAnchor) {
+    resolvedFreshnessColumnId = await resolveColumnNameOrId(
+      payload.docId,
+      payload.tableIdOrName,
+      freshnessColumnIdOrName,
+      codaApiToken,
+      codaReadOptions,
+    );
+    if (resolvedFreshnessColumnId !== freshnessColumnIdOrName) {
+      eventLogger("info", "freshness", "Resolved freshness column ID", {
+        before: freshnessColumnIdOrName,
+        after: resolvedFreshnessColumnId,
+      });
+    }
+  }
+
+  const getCodaSnapshotData = async () => {
     let tableData;
-    if (useRowPayload) {
-      tableData = buildCodaLikeTableDataFromRowPayload(rowPayload);
-    } else if (isRowSync) {
+    if (isRowSync) {
       if (isApiRowId(payload.rowId)) {
         try {
           tableData = await getCodaRowData(
@@ -683,17 +745,19 @@ async function executeSyncWorkflow(payload, eventLogger) {
       );
     }
 
+    return tableData;
+  };
+
+  const buildMappingFromTableData = async (tableData) => {
     const columns = normalizeColumns(tableData.columns);
     const rows = normalizeRows(tableData.rows);
-    const referenceMap = useRowPayload
-      ? buildReferenceMapFromRowPayload(rowPayload)
-      : await buildLinkedCollectionReferenceMap({
-        columns,
-        linkedCollectionName: payload.linkedCollectionName,
-        framerProjectUrl: payload.framerProjectUrl,
-        framerApiKey,
-        eventLogger,
-      });
+    const referenceMap = await buildLinkedCollectionReferenceMap({
+      columns,
+      linkedCollectionName: payload.linkedCollectionName,
+      framerProjectUrl: payload.framerProjectUrl,
+      framerApiKey,
+      eventLogger,
+    });
 
     const mappingResult = buildFieldsAndItems({
       columns,
@@ -722,23 +786,53 @@ async function executeSyncWorkflow(payload, eventLogger) {
   eventLogger("info", "extract", "Fetching Coda snapshot", {
     isRowSync,
     tableIdOrName: payload.tableIdOrName,
-    useRowPayload,
   });
 
   let mappingResult;
-  const mappingAttempts = useRowPayload ? 1 : maxCodaStateRetries;
-  for (let attempt = 1; attempt <= mappingAttempts; attempt += 1) {
-    mappingResult = await getCodaSnapshot();
+  const maxSnapshotAttempts = Math.max(maxCodaStateRetries, hasFreshnessAnchor ? freshnessMaxAttempts : 1);
+  let lastFreshnessActual = "";
+  for (let attempt = 1; attempt <= maxSnapshotAttempts; attempt += 1) {
+    const tableData = await getCodaSnapshotData();
+
+    if (hasFreshnessAnchor) {
+      const freshnessResult = getFreshnessValue(tableData, resolvedFreshnessColumnId, freshnessColumnIdOrName);
+      lastFreshnessActual = freshnessResult.actual;
+      const freshnessMatches = lastFreshnessActual === freshnessExpectedValue;
+      eventLogger(
+        freshnessMatches ? "info" : "warning",
+        "freshness",
+        freshnessMatches ? "Coda API freshness anchor matched" : "Coda API freshness anchor has not settled",
+        {
+          attempt,
+          maxAttempts: freshnessMaxAttempts,
+          column: freshnessResult.columnName,
+          expected: freshnessExpectedValue,
+          actual: lastFreshnessActual,
+        },
+      );
+
+      if (!freshnessMatches) {
+        if (attempt >= freshnessMaxAttempts) {
+          throw new Error(
+            `Coda API freshness check failed for "${freshnessColumnIdOrName}": expected "${freshnessExpectedValue}", got "${lastFreshnessActual}".`,
+          );
+        }
+        await sleep(freshnessDelayMs);
+        continue;
+      }
+    }
+
+    mappingResult = await buildMappingFromTableData(tableData);
 
     const retryableWarning = shouldRetryForTransientCodaWarnings(mappingResult.warnings);
-    if (!retryableWarning || attempt === mappingAttempts) {
+    if (!retryableWarning || attempt === maxSnapshotAttempts) {
       break;
     }
 
     const delayMs = codaStateRetryDelayMs * attempt;
     eventLogger("warning", "extract", "Transient Coda state detected; retrying snapshot", {
       attempt,
-      maxCodaStateRetries: mappingAttempts,
+      maxCodaStateRetries: maxSnapshotAttempts,
       delayMs,
     });
     await sleep(delayMs);
