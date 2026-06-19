@@ -648,11 +648,15 @@ async function executeSyncWorkflow(payload, eventLogger) {
       published: deletePublishSucceeded,
       publishError: deletePublishError,
       deploymentId: deletePublishResult?.deploymentId ?? "",
-      message: deletePublishSucceeded
-        ? `✅ Saved ${deleteConvexResult?.count || 0} to Convex. ${deleteBaseMsg} and published (${new Date().toISOString()}).`
-        : deletePublishRequested
-          ? `⚠️ Saved ${deleteConvexResult?.count || 0} to Convex. ${deleteBaseMsg}, but Framer publish failed: ${deletePublishError}`
-          : `✅ Saved ${deleteConvexResult?.count || 0} to Convex. ${deleteBaseMsg}.`,
+      message: (() => {
+        const convexPrefix = (deleteConvexResult && !deleteConvexResult.skipped) ? `Saved ${deleteConvexResult.count || 0} to Convex. ` : "";
+        const ts = new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+        return deletePublishSucceeded
+          ? `✅ ${convexPrefix}${deleteBaseMsg} and published at ${ts}.`
+          : deletePublishRequested
+            ? `⚠️ ${convexPrefix}${deleteBaseMsg}, but publish failed: ${deletePublishError}`
+            : `✅ ${convexPrefix}${deleteBaseMsg}.`;
+      })(),
     };
   }
 
@@ -686,8 +690,8 @@ async function executeSyncWorkflow(payload, eventLogger) {
   const hasTableFreshnessAnchor = hasTableRowFreshnessAnchor || hasTableColumnFreshnessAnchor;
   const hasFreshnessAnchor = hasRowFreshnessAnchor || hasTableFreshnessAnchor;
   const freshnessMaxAttempts = parseIntEnv(
-    freshness.maxAttempts ?? payload.freshnessMaxAttempts ?? process.env.CODA_FRESHNESS_RETRY_ATTEMPTS ?? 5,
-    5,
+    freshness.maxAttempts ?? payload.freshnessMaxAttempts ?? process.env.CODA_FRESHNESS_RETRY_ATTEMPTS ?? 10,
+    10,
     1,
     20,
   );
@@ -1322,7 +1326,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
     publishError,
     deploymentId: publishResult?.deploymentId ?? "",
     message: publishSucceeded
-      ? `✅ ${convexPrefix}${baseSyncMessage} and published (${new Date().toISOString()}).`
+      ? `✅ ${convexPrefix}${baseSyncMessage} and published at ${new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true })}.`
       : publishRequested
         ? `⚠️ ${convexPrefix}${baseSyncMessage}, but Framer publish failed: ${publishError}`
         : `✅ ${convexPrefix}${baseSyncMessage}. Framer publish queued only when requested.`,
