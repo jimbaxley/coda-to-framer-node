@@ -1026,17 +1026,6 @@ async function executeSyncWorkflow(payload, eventLogger) {
         }
       }
 
-      // Set fields
-      if (!isRowSync || collection.created) {
-        const compatibleFields = framerMappingResult.fields.filter(Boolean);
-        await withTimeout(
-          collectionHandle.setFields(compatibleFields),
-          timeoutMs,
-          "setCollectionFields",
-        );
-        fieldsSet = compatibleFields.length;
-      }
-
       async function fetchItemIds(operationName) {
         if (typeof collectionHandle.getItemIds !== "function") return [];
 
@@ -1074,6 +1063,19 @@ async function executeSyncWorkflow(payload, eventLogger) {
         throw lastError;
       }
 
+      // Set fields and fetch existing item IDs in parallel when possible
+      let prefetchedItemIds = null;
+      if (!isRowSync || collection.created) {
+        const compatibleFields = framerMappingResult.fields.filter(Boolean);
+        const needsItemIds = framerMappingResult.items.length > 0 && typeof collectionHandle.getItemIds === "function";
+        const [, ids] = await Promise.all([
+          withTimeout(collectionHandle.setFields(compatibleFields), timeoutMs, "setCollectionFields"),
+          needsItemIds ? fetchItemIds("getManagedCollectionItemIds (before add, parallel)") : Promise.resolve(null),
+        ]);
+        fieldsSet = compatibleFields.length;
+        prefetchedItemIds = ids;
+      }
+
       if (isRowSync && mappingResult.items.length > 0 && framerMappingResult.items.length === 0) {
         const itemId = String(mappingResult.items[0]?.id || "");
         if (itemId) {
@@ -1095,16 +1097,13 @@ async function executeSyncWorkflow(payload, eventLogger) {
       }
 
       if (framerMappingResult.items.length > 0) {
-        // Fetch existing item IDs before add
+        // Use prefetched IDs (from parallel setFields call) or fetch now
         let existingItemIds = [];
         try {
-          if (typeof collectionHandle.getItemIds === "function") {
-            const ids = await withTimeout(
-              collectionHandle.getItemIds(),
-              timeoutMs,
-              "getManagedCollectionItemIds (before add)",
-            );
-            existingItemIds = Array.isArray(ids) ? ids.map((id) => String(id)) : [];
+          if (prefetchedItemIds !== null) {
+            existingItemIds = prefetchedItemIds;
+          } else if (typeof collectionHandle.getItemIds === "function") {
+            existingItemIds = await fetchItemIds("getManagedCollectionItemIds (before add)");
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
