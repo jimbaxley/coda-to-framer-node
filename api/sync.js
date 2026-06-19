@@ -326,6 +326,21 @@ function normalizeFreshnessPresence(value) {
   return "present";
 }
 
+function normalizeTableFreshnessMode(value) {
+  const normalized = String(value || "nonblank").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (["any-nonblank", "any-filled", "any"].includes(normalized)) return "any-nonblank";
+  if (["stable", "settled", "unchanged"].includes(normalized)) return "stable";
+  return "nonblank";
+}
+
+function getColumnValuesForFreshness(tableData, columnId, columnIdOrName) {
+  const column = findColumnForFreshness(tableData, columnId, columnIdOrName);
+  const columnName = column?.name || String(columnIdOrName || "");
+  const rows = tableData.rows || [];
+  const values = rows.map((row) => normalizeFreshnessValue(row?.values?.[columnName]));
+  return { columnName, rows, values };
+}
+
 function normalizeReferenceName(value) {
   return String(value || "")
     .trim()
@@ -660,8 +675,11 @@ async function executeSyncWorkflow(payload, eventLogger) {
   const freshnessExpectedPresence = normalizeFreshnessPresence(
     freshness.expectedPresence || payload.freshnessExpectedPresence,
   );
+  const freshnessMode = normalizeTableFreshnessMode(freshness.mode || payload.freshnessMode);
   const hasRowFreshnessAnchor = isRowSync && Boolean(freshnessColumnIdOrName);
-  const hasTableFreshnessAnchor = !isRowSync && Boolean(freshnessRowSelector);
+  const hasTableRowFreshnessAnchor = !isRowSync && Boolean(freshnessRowSelector);
+  const hasTableColumnFreshnessAnchor = !isRowSync && Boolean(freshnessColumnIdOrName) && !freshnessRowSelector;
+  const hasTableFreshnessAnchor = hasTableRowFreshnessAnchor || hasTableColumnFreshnessAnchor;
   const hasFreshnessAnchor = hasRowFreshnessAnchor || hasTableFreshnessAnchor;
   const freshnessMaxAttempts = parseIntEnv(
     freshness.maxAttempts ?? payload.freshnessMaxAttempts ?? process.env.CODA_FRESHNESS_RETRY_ATTEMPTS ?? 5,
@@ -810,6 +828,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
   const maxSnapshotAttempts = Math.max(maxCodaStateRetries, hasFreshnessAnchor ? freshnessMaxAttempts : 1);
   let lastFreshnessActual = "";
   let lastFreshnessPresence = "";
+  let lastTableFreshnessSignature = "";
   for (let attempt = 1; attempt <= maxSnapshotAttempts; attempt += 1) {
     const tableData = await getCodaSnapshotData();
 
@@ -841,7 +860,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
       }
     }
 
-    if (hasTableFreshnessAnchor) {
+    if (hasTableRowFreshnessAnchor) {
       const matchedFreshnessRow = findRowBySelector(tableData, freshnessRowSelector, resolvedSlugFieldId);
       lastFreshnessPresence = matchedFreshnessRow ? "present" : "absent";
       const presenceMatches = lastFreshnessPresence === freshnessExpectedPresence;
@@ -887,6 +906,48 @@ async function executeSyncWorkflow(payload, eventLogger) {
             `Coda table freshness check failed for "${freshnessColumnIdOrName}" on "${freshnessRowSelector}": expected "${freshnessExpectedValue}", got "${lastFreshnessActual}".`,
           );
         }
+        await sleep(freshnessDelayMs);
+        continue;
+      }
+    }
+
+    if (hasTableColumnFreshnessAnchor) {
+      const columnValues = getColumnValuesForFreshness(tableData, resolvedFreshnessColumnId, freshnessColumnIdOrName);
+      const blankCount = columnValues.values.filter((value) => !value).length;
+      const nonblankCount = columnValues.values.length - blankCount;
+      const signature = columnValues.values.join("\u001f");
+      let freshnessMatches = false;
+
+      if (freshnessMode === "any-nonblank") {
+        freshnessMatches = nonblankCount > 0;
+      } else if (freshnessMode === "stable") {
+        freshnessMatches = attempt > 1 && signature === lastTableFreshnessSignature;
+      } else {
+        freshnessMatches = columnValues.rows.length > 0 && blankCount === 0;
+      }
+
+      eventLogger(
+        freshnessMatches ? "info" : "warning",
+        "freshness",
+        freshnessMatches ? "Coda table column freshness matched" : "Coda table column freshness has not settled",
+        {
+          attempt,
+          maxAttempts: freshnessMaxAttempts,
+          column: columnValues.columnName,
+          mode: freshnessMode,
+          rowCount: columnValues.rows.length,
+          nonblankCount,
+          blankCount,
+        },
+      );
+
+      if (!freshnessMatches) {
+        if (attempt >= freshnessMaxAttempts) {
+          throw new Error(
+            `Coda table freshness check failed for "${freshnessColumnIdOrName}" in ${freshnessMode} mode: ${blankCount} blank value(s) across ${columnValues.rows.length} row(s).`,
+          );
+        }
+        lastTableFreshnessSignature = signature;
         await sleep(freshnessDelayMs);
         continue;
       }
