@@ -1646,6 +1646,16 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // eliminates the need to recreate or patch later.
     let rowWasCreatedHere = false;
     if (!resolvedStatusRowId) {
+      if (statusOnlyCallback) {
+        eventLogger("warning", "callback", "Skipped status-only callback: no target row resolved", {
+          statusDocId,
+          statusTableIdOrName: resolvedStatusTableId,
+          statusRowSelector,
+          statusColumnNameOrId,
+        });
+        return;
+      }
+
       // Run the source mirror write in parallel with the log row creation —
       // they target different tables and are fully independent.
       const [created] = await Promise.all([
