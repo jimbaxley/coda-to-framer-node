@@ -1462,12 +1462,15 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       codaApiToken,
     );
 
-    const resolvedStatusColumnId = await resolveColumnNameOrId(
-      statusDocId,
-      resolvedStatusTableId,
-      statusColumnNameOrId,
-      codaApiToken,
-    );
+    // Resolve status column, source base table (for log-table detection), and
+    // table columns all in parallel — none depend on each other.
+    const [resolvedStatusColumnId, sourceBaseTableId, tableColumns] = await Promise.all([
+      resolveColumnNameOrId(statusDocId, resolvedStatusTableId, statusColumnNameOrId, codaApiToken),
+      payload.tableIdOrName
+        ? resolveBaseTableId(statusDocId, payload.tableIdOrName, codaApiToken).catch(() => "")
+        : Promise.resolve(""),
+      getCodaTableColumns(statusDocId, resolvedStatusTableId, codaApiToken),
+    ]);
 
     // Distinguish a dedicated sync-log table from a write-back to the source
     // row. deleteRow (and row-level sync) write status onto the source row, so
@@ -1476,29 +1479,9 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // added, ...) onto the row — e.g. logValues.Status = "completed" would
     // overwrite the workflow Status column. Only a separate log table should
     // receive them.
-    let sourceBaseTableId = "";
-    if (payload.tableIdOrName) {
-      try {
-        sourceBaseTableId = await resolveBaseTableId(
-          statusDocId,
-          payload.tableIdOrName,
-          codaApiToken,
-        );
-      } catch (_) {
-        sourceBaseTableId = "";
-      }
-    }
     const isDedicatedLogTable = hasExplicitCallbackTable
       && Boolean(sourceBaseTableId)
       && resolvedStatusTableId !== sourceBaseTableId;
-
-    // Precompute table columns and the full set of log cells so we can create
-    // a single, complete log row if needed (avoids partial/duplicate rows).
-    const tableColumns = await getCodaTableColumns(
-      statusDocId,
-      resolvedStatusTableId,
-      codaApiToken,
-    );
 
     const byLowerName = new Map(
       tableColumns.map((column) => [String(column?.name || "").toLowerCase(), String(column?.id || "")]),
