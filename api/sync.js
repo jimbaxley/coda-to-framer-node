@@ -2158,7 +2158,7 @@ export default async function handler(req, res) {
           jobId: existing.jobId,
           requestId: existing.requestId,
           status: existing.status,
-          message: `Request already accepted (jobId: ${existing.jobId}).`,
+          message: `⏳ Already running (jobId: ${existing.jobId})`,
         });
       }
     }
@@ -2199,12 +2199,14 @@ export default async function handler(req, res) {
       requestId,
     });
 
+    const actionLabel = ({ sync: "Sync", rowSync: "Row Sync", deleteRow: "Delete" })[payloadWithCallbackRow.action] || "Sync";
+    const startedAt = new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
     return sendJson(res, 202, {
       accepted: true,
       jobId,
       requestId,
       status: "queued",
-      message: `Request accepted. Processing started (jobId: ${jobId}).`,
+      message: `⏳ ${actionLabel} started at ${startedAt}`,
       statusUrl: `/api/sync?jobId=${jobId}`,
     });
   } catch (error) {
