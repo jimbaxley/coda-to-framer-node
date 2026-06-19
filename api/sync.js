@@ -1063,17 +1063,13 @@ async function executeSyncWorkflow(payload, eventLogger) {
         throw lastError;
       }
 
-      // Set fields and fetch existing item IDs in parallel when possible
+      // Set fields first — getItemIds shares the same WebSocket connection,
+      // so running them in parallel risks a flaky connection killing both.
       let prefetchedItemIds = null;
       if (!isRowSync || collection.created) {
         const compatibleFields = framerMappingResult.fields.filter(Boolean);
-        const needsItemIds = framerMappingResult.items.length > 0 && typeof collectionHandle.getItemIds === "function";
-        const [, ids] = await Promise.all([
-          withTimeout(collectionHandle.setFields(compatibleFields), timeoutMs, "setCollectionFields"),
-          needsItemIds ? fetchItemIds("getManagedCollectionItemIds (before add, parallel)") : Promise.resolve(null),
-        ]);
+        await withTimeout(collectionHandle.setFields(compatibleFields), timeoutMs, "setCollectionFields");
         fieldsSet = compatibleFields.length;
-        prefetchedItemIds = ids;
       }
 
       if (isRowSync && mappingResult.items.length > 0 && framerMappingResult.items.length === 0) {
@@ -1097,12 +1093,9 @@ async function executeSyncWorkflow(payload, eventLogger) {
       }
 
       if (framerMappingResult.items.length > 0) {
-        // Use prefetched IDs (from parallel setFields call) or fetch now
         let existingItemIds = [];
         try {
-          if (prefetchedItemIds !== null) {
-            existingItemIds = prefetchedItemIds;
-          } else if (typeof collectionHandle.getItemIds === "function") {
+          if (typeof collectionHandle.getItemIds === "function") {
             existingItemIds = await fetchItemIds("getManagedCollectionItemIds (before add)");
           }
         } catch (error) {
@@ -1645,12 +1638,12 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // eliminates the need to recreate or patch later.
     let rowWasCreatedHere = false;
     if (!resolvedStatusRowId) {
-      const created = await createTableRow(
-        statusDocId,
-        resolvedStatusTableId,
-        cellsToUpdate,
-        codaApiToken,
-      );
+      // Run the source mirror write in parallel with the log row creation —
+      // they target different tables and are fully independent.
+      const [created] = await Promise.all([
+        createTableRow(statusDocId, resolvedStatusTableId, cellsToUpdate, codaApiToken),
+        writeSourceStatusMirror(),
+      ]);
       resolvedStatusRowId = created.rowId || "";
       if (resolvedStatusRowId) {
         rowWasCreatedHere = true;
@@ -1661,8 +1654,6 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
           rowSelector: resolvedStatusRowId,
           usedRowId: true,
         });
-        // allow brief eventual-consistency window before further ops
-        await sleep(300);
       }
     }
 
@@ -1671,7 +1662,6 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // issuing additional updates immediately afterwards is what was blowing
     // Coda’s rate limit when a row is autocreated during a sync.
     if (rowWasCreatedHere) {
-      await writeSourceStatusMirror();
       eventLogger("info", "callback", "Callback row just created; skipping follow-on updates");
       return;
     }
