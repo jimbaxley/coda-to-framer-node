@@ -1515,27 +1515,21 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       }
 
       try {
-        const sourceStatusColumnId = await resolveColumnNameOrId(
-          statusDocId,
-          sourceBaseTableId,
-          sourceStatusColumnInput,
-          codaApiToken,
-        );
+        const sourceRowSelector = String(payload.rowId || "").trim();
+        const needsSlugResolve = !isApiRowId(sourceRowSelector) && (payload.slugFieldId || "");
+
+        const [sourceStatusColumnId, resolvedSourceSlugFieldId] = await Promise.all([
+          resolveColumnNameOrId(statusDocId, sourceBaseTableId, sourceStatusColumnInput, codaApiToken),
+          needsSlugResolve
+            ? resolveColumnNameOrId(statusDocId, sourceBaseTableId, needsSlugResolve, codaApiToken)
+            : Promise.resolve(""),
+        ]);
 
         let sourceRowId = "";
-        const sourceRowSelector = String(payload.rowId || "").trim();
         if (isApiRowId(sourceRowSelector)) {
           sourceRowId = sourceRowSelector;
         } else {
-          let sourceSlugFieldId = payload.slugFieldId || "";
-          if (sourceSlugFieldId) {
-            sourceSlugFieldId = await resolveColumnNameOrId(
-              statusDocId,
-              sourceBaseTableId,
-              sourceSlugFieldId,
-              codaApiToken,
-            );
-          }
+          let sourceSlugFieldId = resolvedSourceSlugFieldId;
 
           const sourceTableData = await getCodaTableData(
             statusDocId,
