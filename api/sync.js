@@ -1372,6 +1372,8 @@ function scheduleCallbackRetry(originalPayload, message, retryCount, eventLogger
 
 async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = null, context = {}) {
   const callback = payload.callback || {};
+  const hasCallbackPayload = Boolean(payload.callback && Object.keys(callback).length > 0);
+  const isSyncWithoutCallback = !hasCallbackPayload && String(payload.action || "sync") === "sync";
   const hasExplicitCallbackTable = Object.prototype.hasOwnProperty.call(callback, "statusTableIdOrName")
     || Object.prototype.hasOwnProperty.call(callback, "statusTableInput");
   const defaultCallbackTableName = getDefaultCallbackTableName();
@@ -1379,7 +1381,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
   const rawStatusRowSelector = callback.statusRow || callback.statusRowId || callback.statusRowSelector || payload.rowId || "";
   const rawStatusTableIdOrName = callback.statusTableIdOrName
     || callback.statusTableInput
-    || (hasExplicitCallbackTable ? defaultCallbackTableName : (payload.tableIdOrName || ""));
+    || (isSyncWithoutCallback ? "FramerSync" : (hasExplicitCallbackTable ? defaultCallbackTableName : (payload.tableIdOrName || "")));
   const statusDocId = callback.statusDocId || payload.docId || "";
 
   const statusColumnNameOrId = String(rawStatusColumnNameOrId || "").trim();
@@ -1473,7 +1475,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // added, ...) onto the row — e.g. logValues.Status = "completed" would
     // overwrite the workflow Status column. Only a separate log table should
     // receive them.
-    const statusOnlyCallback = callback.statusOnly === true || callback.lightweight === true || callback.skipLogValues === true;
+    const statusOnlyCallback = isSyncWithoutCallback || callback.statusOnly === true || callback.lightweight === true || callback.skipLogValues === true;
     const isDedicatedLogTable = !statusOnlyCallback
       && hasExplicitCallbackTable
       && Boolean(sourceBaseTableId)
