@@ -3,6 +3,7 @@ import { waitUntil as vercelWaitUntil } from "@vercel/functions";
 import {
   getCodaTableData,
   getCodaRowData,
+  getCodaRowByColumnValue,
   getCodaTableColumns,
   resolveColumnNameOrId,
   resolveTableNameOrId,
@@ -535,18 +536,38 @@ async function executeSyncWorkflow(payload, eventLogger) {
       );
     }
 
-    eventLogger("info", "extract", "Searching Coda table for row by slug (deleteRow)", {
+    eventLogger("info", "extract", "Searching Coda table for row (deleteRow)", {
       tableIdOrName: payload.tableIdOrName,
       searchTableId: deleteSearchTableId,
       rowId: payload.rowId,
     });
 
-    const deleteTableData = await getCodaTableDataPaginated(
-      payload.docId,
-      deleteSearchTableId,
-      codaApiToken,
-      deleteReadOptions,
-    );
+    let deleteTableData;
+    if (isApiRowId(payload.rowId)) {
+      deleteTableData = await getCodaRowData(
+        payload.docId,
+        deleteSearchTableId,
+        payload.rowId,
+        codaApiToken,
+        deleteReadOptions,
+      );
+    } else if (resolvedSlugFieldId) {
+      deleteTableData = await getCodaRowByColumnValue(
+        payload.docId,
+        deleteSearchTableId,
+        resolvedSlugFieldId,
+        payload.rowId,
+        codaApiToken,
+        deleteReadOptions,
+      );
+    } else {
+      deleteTableData = await getCodaTableDataPaginated(
+        payload.docId,
+        deleteSearchTableId,
+        codaApiToken,
+        deleteReadOptions,
+      );
+    }
 
     const matchedRow = findRowBySelector(deleteTableData, payload.rowId, resolvedSlugFieldId);
 
@@ -587,43 +608,26 @@ async function executeSyncWorkflow(payload, eventLogger) {
       payload.framerProjectUrl,
       framerApiKey,
       payload.collectionName,
-      async ({ framer, collection: collectionHandle, collectionMeta, timeoutMs }) => {
+      async ({ collection: collectionHandle, collectionMeta, timeoutMs }) => {
         deleteCollection = collectionMeta;
         await withTimeout(
           collectionHandle.removeItems([framerItemId]),
           timeoutMs,
           "removeItem (deleteRow)",
         );
-
-        if (deletePublishRequested) {
-          eventLogger("info", "publishing", "Publishing project after deleteRow");
-          const publishTimeoutMs = getPublishTimeoutMs();
-          try {
-            let rawResult;
-            try {
-              rawResult = await withTimeout(framer.publish(), publishTimeoutMs, "publishProject");
-            } catch (error) {
-              const formatted = formatFramerError("publish", error);
-              throw new Error(formatted.message);
-            }
-            const deploymentId = rawResult?.deployment?.id || "";
-            if (!deploymentId) {
-              throw new Error("publish failed | missing deployment id in publish result");
-            }
-            try {
-              await withTimeout(framer.deploy(deploymentId), publishTimeoutMs, "deployProject");
-            } catch (error) {
-              const formatted = formatFramerError("deploy", error);
-              throw new Error(formatted.message);
-            }
-            deletePublishResult = { published: true, deploymentId };
-          } catch (error) {
-            deletePublishError = error instanceof Error ? error.message : String(error);
-            eventLogger("warning", "publishing", "Publish failed after deleteRow", { error: deletePublishError });
-          }
-        }
       },
     );
+
+    if (deletePublishRequested) {
+      eventLogger("info", "publishing", "Publishing project after deleteRow");
+      try {
+        const pubResult = await publishProject(payload.framerProjectUrl, framerApiKey);
+        deletePublishResult = { published: true, deploymentId: pubResult.deploymentId };
+      } catch (error) {
+        deletePublishError = error instanceof Error ? error.message : String(error);
+        eventLogger("warning", "publishing", "Publish failed after deleteRow", { error: deletePublishError });
+      }
+    }
 
     const deletePublishSucceeded = Boolean(deletePublishResult?.published);
     const deleteName = normalizeSelectorValue(payload.rowId);
@@ -743,24 +747,42 @@ async function executeSyncWorkflow(payload, eventLogger) {
       }
 
       if (!tableData) {
-        const selectorData = await getCodaTableData(
-          payload.docId,
-          payload.tableIdOrName,
-          codaApiToken,
-          payload.rowLimit || 500,
-          codaReadOptions,
-        );
-        const matchedRow = findRowBySelector(selectorData, payload.rowId, resolvedSlugFieldId);
-        if (!matchedRow) {
-          const normalizedSelector = normalizeSelectorValue(payload.rowId);
-          throw new Error(
-            `Row not found for selector "${normalizedSelector}". Pass API row ID (i-...) or unique slug value from the slug field.`,
+        // If we have a slug field, use Coda's server-side query to find just this row
+        // instead of fetching up to 500 rows and searching locally.
+        if (resolvedSlugFieldId) {
+          const queried = await getCodaRowByColumnValue(
+            payload.docId,
+            payload.tableIdOrName,
+            resolvedSlugFieldId,
+            payload.rowId,
+            codaApiToken,
+            codaReadOptions,
           );
+          const matchedRow = findRowBySelector(queried, payload.rowId, resolvedSlugFieldId);
+          if (!matchedRow) {
+            const normalizedSelector = normalizeSelectorValue(payload.rowId);
+            throw new Error(
+              `Row not found for selector "${normalizedSelector}". Pass API row ID (i-...) or unique slug value from the slug field.`,
+            );
+          }
+          tableData = { columns: queried.columns, rows: [matchedRow] };
+        } else {
+          const selectorData = await getCodaTableData(
+            payload.docId,
+            payload.tableIdOrName,
+            codaApiToken,
+            payload.rowLimit || 500,
+            codaReadOptions,
+          );
+          const matchedRow = findRowBySelector(selectorData, payload.rowId, resolvedSlugFieldId);
+          if (!matchedRow) {
+            const normalizedSelector = normalizeSelectorValue(payload.rowId);
+            throw new Error(
+              `Row not found for selector "${normalizedSelector}". Pass API row ID (i-...) or unique slug value from the slug field.`,
+            );
+          }
+          tableData = { columns: selectorData.columns, rows: [matchedRow] };
         }
-        tableData = {
-          columns: selectorData.columns,
-          rows: [matchedRow],
-        };
       }
     } else {
       tableData = await getCodaTableData(
@@ -1094,13 +1116,18 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
       if (framerMappingResult.items.length > 0) {
         let existingItemIds = [];
-        try {
-          if (typeof collectionHandle.getItemIds === "function") {
-            existingItemIds = await fetchItemIds("getManagedCollectionItemIds (before add)");
+        // Skip getItemIds for rowSync — it's only needed for post-add verification
+        // and deleteMissing (fullSync only). On flaky Framer connections it causes
+        // "Connection closed" errors that burn through all retries and fail the job.
+        if (!isRowSync) {
+          try {
+            if (typeof collectionHandle.getItemIds === "function") {
+              existingItemIds = await fetchItemIds("getManagedCollectionItemIds (before add)");
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            eventLogger("warning", "framer_sync", "Could not fetch existing item ids before add", { message });
           }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          eventLogger("warning", "framer_sync", "Could not fetch existing item ids before add", { message });
         }
 
         // Fetch collection fields for remapping (use object fields first, fall back to getFields)
@@ -1187,9 +1214,9 @@ async function executeSyncWorkflow(payload, eventLogger) {
           );
         }
 
-        // Verify items landed
+        // Verify items landed (fullSync only — skip for rowSync to avoid flaky getItemIds calls)
         try {
-          if (typeof collectionHandle.getItemIds === "function") {
+          if (!isRowSync && typeof collectionHandle.getItemIds === "function") {
             const afterIds = await fetchItemIds("getManagedCollectionItemIds (after add)");
             const beforeSet = new Set(existingItemIds);
             const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
