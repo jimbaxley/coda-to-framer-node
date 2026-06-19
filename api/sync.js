@@ -1257,48 +1257,19 @@ async function executeSyncWorkflow(payload, eventLogger) {
         }
       }
 
-      // Publish within the same session
-      if (payload.publish) {
-        eventLogger("info", "publishing", "Publishing project");
-        const publishTimeoutMs = getPublishTimeoutMs();
-        try {
-          let rawResult;
-          try {
-            rawResult = await withTimeout(framer.publish(), publishTimeoutMs, "publishProject");
-          } catch (error) {
-            const formatted = formatFramerError("publish", error);
-            log("error", "publish_failed", { projectUrl: payload.framerProjectUrl, ...formatted.fields });
-            throw new Error(formatted.message);
-          }
-
-          const deploymentId = rawResult?.deployment?.id || "";
-          log("info", "publish_result", {
-            projectUrl: payload.framerProjectUrl,
-            deploymentId,
-            hostnamesCount: Array.isArray(rawResult?.hostnames) ? rawResult.hostnames.length : 0,
-          });
-
-          if (!deploymentId) {
-            throw new Error("publish failed | missing deployment id in publish result");
-          }
-
-          try {
-            await withTimeout(framer.deploy(deploymentId), publishTimeoutMs, "deployProject");
-          } catch (error) {
-            const formatted = formatFramerError("deploy", error);
-            log("error", "deploy_failed", { projectUrl: payload.framerProjectUrl, deploymentId, ...formatted.fields });
-            throw new Error(formatted.message);
-          }
-
-          log("info", "deploy_complete", { projectUrl: payload.framerProjectUrl, deploymentId });
-          publishResult = { published: true, changeCount: 1, deploymentId, message: "Successfully published and deployed" };
-        } catch (error) {
-          publishError = error instanceof Error ? error.message : String(error);
-          eventLogger("warning", "publishing", "Publish failed after successful sync", { error: publishError });
-        }
-      }
     },
   );
+
+  if (publishRequested) {
+    eventLogger("info", "publishing", "Publishing project");
+    try {
+      const pubResult = await publishProject(payload.framerProjectUrl, framerApiKey);
+      publishResult = { published: true, deploymentId: pubResult.deploymentId };
+    } catch (error) {
+      publishError = error instanceof Error ? error.message : String(error);
+      eventLogger("warning", "publishing", "Publish failed after successful sync", { error: publishError });
+    }
+  }
 
   const publishSucceeded = Boolean(publishResult?.published);
   const overallSuccess = !publishRequested || publishSucceeded;
