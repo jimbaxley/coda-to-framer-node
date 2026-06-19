@@ -29,6 +29,10 @@ import {
   shouldPublishItemToFramer,
   upsertEventsToConvex,
 } from "../lib/convex-client.js";
+import {
+  buildCodaLikeTableDataFromRowPayload,
+  buildReferenceMapFromRowPayload,
+} from "../lib/row-payload.js";
 
 function normalizeCollectionFieldsLocal(fields) {
   return (Array.isArray(fields) ? fields : [])
@@ -259,6 +263,22 @@ function parseBooleanFlag(value, fallback = false) {
   if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
   return fallback;
+}
+
+function getRowPayloadFromSyncPayload(payload) {
+  if (payload.rowPayload && typeof payload.rowPayload === "object") {
+    return payload.rowPayload;
+  }
+
+  const rowPayloadJson = String(payload.rowPayloadJson || "").trim();
+  if (!rowPayloadJson) return null;
+
+  try {
+    return JSON.parse(rowPayloadJson);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`rowPayloadJson is not valid JSON: ${message}`);
+  }
 }
 
 function normalizeReferenceName(value) {
@@ -577,6 +597,12 @@ async function executeSyncWorkflow(payload, eventLogger) {
     throw new Error("Missing required field for rowSync: rowId");
   }
 
+  const useRowPayload = isRowSync && parseBooleanFlag(payload.useRowPayload, false);
+  const rowPayload = useRowPayload ? getRowPayloadFromSyncPayload(payload) : null;
+  if (useRowPayload && !rowPayload) {
+    throw new Error("useRowPayload is true, but rowPayloadJson/rowPayload was not provided.");
+  }
+
   let resolvedSlugFieldId = payload.slugFieldId;
   const codaReadOptions = {
     requireLatest: parseBooleanFlag(
@@ -586,9 +612,10 @@ async function executeSyncWorkflow(payload, eventLogger) {
   };
   eventLogger("info", "extract", "Configured Coda snapshot read mode", {
     requireLatest: codaReadOptions.requireLatest,
+    useRowPayload,
   });
 
-  if (payload.slugFieldId) {
+  if (!useRowPayload && payload.slugFieldId) {
     resolvedSlugFieldId = await resolveColumnNameOrId(
       payload.docId,
       payload.tableIdOrName,
@@ -606,7 +633,9 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
   const getCodaSnapshot = async () => {
     let tableData;
-    if (isRowSync) {
+    if (useRowPayload) {
+      tableData = buildCodaLikeTableDataFromRowPayload(rowPayload);
+    } else if (isRowSync) {
       if (isApiRowId(payload.rowId)) {
         try {
           tableData = await getCodaRowData(
@@ -656,13 +685,15 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
     const columns = normalizeColumns(tableData.columns);
     const rows = normalizeRows(tableData.rows);
-    const referenceMap = await buildLinkedCollectionReferenceMap({
-      columns,
-      linkedCollectionName: payload.linkedCollectionName,
-      framerProjectUrl: payload.framerProjectUrl,
-      framerApiKey,
-      eventLogger,
-    });
+    const referenceMap = useRowPayload
+      ? buildReferenceMapFromRowPayload(rowPayload)
+      : await buildLinkedCollectionReferenceMap({
+        columns,
+        linkedCollectionName: payload.linkedCollectionName,
+        framerProjectUrl: payload.framerProjectUrl,
+        framerApiKey,
+        eventLogger,
+      });
 
     const mappingResult = buildFieldsAndItems({
       columns,
@@ -691,21 +722,23 @@ async function executeSyncWorkflow(payload, eventLogger) {
   eventLogger("info", "extract", "Fetching Coda snapshot", {
     isRowSync,
     tableIdOrName: payload.tableIdOrName,
+    useRowPayload,
   });
 
   let mappingResult;
-  for (let attempt = 1; attempt <= maxCodaStateRetries; attempt += 1) {
+  const mappingAttempts = useRowPayload ? 1 : maxCodaStateRetries;
+  for (let attempt = 1; attempt <= mappingAttempts; attempt += 1) {
     mappingResult = await getCodaSnapshot();
 
     const retryableWarning = shouldRetryForTransientCodaWarnings(mappingResult.warnings);
-    if (!retryableWarning || attempt === maxCodaStateRetries) {
+    if (!retryableWarning || attempt === mappingAttempts) {
       break;
     }
 
     const delayMs = codaStateRetryDelayMs * attempt;
     eventLogger("warning", "extract", "Transient Coda state detected; retrying snapshot", {
       attempt,
-      maxCodaStateRetries,
+      maxCodaStateRetries: mappingAttempts,
       delayMs,
     });
     await sleep(delayMs);

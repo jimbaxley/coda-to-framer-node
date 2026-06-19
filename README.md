@@ -4,6 +4,32 @@ Node backend for syncing Coda tables to Framer managed collections using the `fr
 
 Supports both full-table sync and single-row sync.
 
+## Row payload sync
+
+For row-level pushes triggered from Coda buttons, the worker can skip the Coda API snapshot and use a typed row payload supplied by the Pack. This avoids the lag where Coda's API may return a stale value immediately after a row edit.
+
+Set these payload fields on a normal `rowSync` request:
+
+```json
+{
+  "action": "rowSync",
+  "useRowPayload": true,
+  "rowPayloadJson": "{\"id\":\"i-row\",\"rowId\":\"i-row\",\"slug\":\"event-slug\",\"values\":{\"Title\":{\"id\":\"title\",\"type\":\"text\",\"value\":\"Fresh title\"}}}"
+}
+```
+
+Payload values should be typed objects:
+
+```json
+{
+  "Title": { "id": "title", "type": "text", "value": "Fresh title" },
+  "Start Date": { "id": "start_date", "type": "date", "value": "2026-06-19T15:30:00.000Z" },
+  "Live": { "id": "live", "type": "checkbox", "value": true }
+}
+```
+
+The payload is normalized into the same Coda-like `columns + rows` shape used by the existing mapper, so date, rich text, link, image, file, number, boolean, select-list stringification, and multi-reference conversion stay centralized in `lib/mapping.js`.
+
 ## Environment Variables
 
 - `CODA_API_TOKEN` - Coda API token with access to the source doc

@@ -11,5 +11,10 @@
     "framer-api": "^0.1.1",
     "marked": "^12.0.2",
     "sanitize-html": "^2.13.0"
+  },
+  "scripts": {
+    "test:row-payload": "node scripts/test-row-payload-mapping.js",
+    "test:row-payload:validation": "node scripts/test-row-payload-validation.js",
+    "test:payload": "npm run test:row-payload && npm run test:row-payload:validation"
   }
 }
