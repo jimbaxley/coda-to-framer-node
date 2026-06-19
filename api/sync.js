@@ -698,37 +698,28 @@ async function executeSyncWorkflow(payload, eventLogger) {
     hasFreshnessAnchor,
   });
 
-  if (payload.slugFieldId) {
-    resolvedSlugFieldId = await resolveColumnNameOrId(
-      payload.docId,
-      payload.tableIdOrName,
-      payload.slugFieldId,
-      codaApiToken,
-      codaReadOptions,
-    );
-    if (resolvedSlugFieldId !== payload.slugFieldId) {
-      eventLogger("info", "resolve_slug", "Resolved slug field ID", {
-        before: payload.slugFieldId,
-        after: resolvedSlugFieldId,
-      });
-    }
+  let resolvedFreshnessColumnId = freshnessColumnIdOrName;
+  [resolvedSlugFieldId, resolvedFreshnessColumnId] = await Promise.all([
+    payload.slugFieldId
+      ? resolveColumnNameOrId(payload.docId, payload.tableIdOrName, payload.slugFieldId, codaApiToken, codaReadOptions)
+      : Promise.resolve(resolvedSlugFieldId),
+    freshnessColumnIdOrName
+      ? resolveColumnNameOrId(payload.docId, payload.tableIdOrName, freshnessColumnIdOrName, codaApiToken, codaReadOptions)
+      : Promise.resolve(resolvedFreshnessColumnId),
+  ]);
+
+  if (resolvedSlugFieldId !== payload.slugFieldId && payload.slugFieldId) {
+    eventLogger("info", "resolve_slug", "Resolved slug field ID", {
+      before: payload.slugFieldId,
+      after: resolvedSlugFieldId,
+    });
   }
 
-  let resolvedFreshnessColumnId = freshnessColumnIdOrName;
-  if (freshnessColumnIdOrName) {
-    resolvedFreshnessColumnId = await resolveColumnNameOrId(
-      payload.docId,
-      payload.tableIdOrName,
-      freshnessColumnIdOrName,
-      codaApiToken,
-      codaReadOptions,
-    );
-    if (resolvedFreshnessColumnId !== freshnessColumnIdOrName) {
-      eventLogger("info", "freshness", "Resolved freshness column ID", {
-        before: freshnessColumnIdOrName,
-        after: resolvedFreshnessColumnId,
-      });
-    }
+  if (resolvedFreshnessColumnId !== freshnessColumnIdOrName && freshnessColumnIdOrName) {
+    eventLogger("info", "freshness", "Resolved freshness column ID", {
+      before: freshnessColumnIdOrName,
+      after: resolvedFreshnessColumnId,
+    });
   }
 
   const getCodaSnapshotData = async () => {
