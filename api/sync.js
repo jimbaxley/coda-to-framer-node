@@ -650,7 +650,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
       deploymentId: deletePublishResult?.deploymentId ?? "",
       message: (() => {
         const convexPrefix = (deleteConvexResult && !deleteConvexResult.skipped) ? `Saved ${deleteConvexResult.count || 0} to Convex. ` : "";
-        const ts = new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+        const ts = new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/New_York" }) + " ET";
         return deletePublishSucceeded
           ? `✅ ${convexPrefix}${deleteBaseMsg} and published at ${ts}.`
           : deletePublishRequested
@@ -1326,7 +1326,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
     publishError,
     deploymentId: publishResult?.deploymentId ?? "",
     message: publishSucceeded
-      ? `✅ ${convexPrefix}${baseSyncMessage} and published at ${new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true })}.`
+      ? `✅ ${convexPrefix}${baseSyncMessage} and published at ${new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/New_York" })} ET.`
       : publishRequested
         ? `⚠️ ${convexPrefix}${baseSyncMessage}, but Framer publish failed: ${publishError}`
         : `✅ ${convexPrefix}${baseSyncMessage}. Framer publish queued only when requested.`,
@@ -2204,12 +2204,13 @@ export default async function handler(req, res) {
     });
 
     const actionLabel = ({ sync: "Sync", rowSync: "Row Sync", deleteRow: "Delete" })[payloadWithCallbackRow.action] || "Sync";
-    const startedAt = new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+    const startedAt = new Date().toLocaleString("en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/New_York" }) + " ET";
     return sendJson(res, 202, {
       accepted: true,
       jobId,
       requestId,
       status: "queued",
+      action: payloadWithCallbackRow.action,
       message: `⏳ ${actionLabel} started at ${startedAt}`,
       statusUrl: `/api/sync?jobId=${jobId}`,
     });
