@@ -293,10 +293,10 @@ function normalizeFreshnessValue(value) {
   return String(value).trim();
 }
 
-function getFreshnessValue(tableData, columnId, columnIdOrName) {
+function findColumnForFreshness(tableData, columnId, columnIdOrName) {
   const normalizedColumnId = String(columnId || "").trim();
   const normalizedInput = String(columnIdOrName || "").trim().toLowerCase();
-  const column = (tableData.columns || []).find((candidate) => {
+  return (tableData.columns || []).find((candidate) => {
     const id = String(candidate?.id || "").trim();
     const name = String(candidate?.name || "").trim();
     return (
@@ -305,13 +305,25 @@ function getFreshnessValue(tableData, columnId, columnIdOrName) {
       || name.toLowerCase() === normalizedInput
     );
   });
+}
+
+function getFreshnessValue(tableData, columnId, columnIdOrName, rowInput = null) {
+  const column = findColumnForFreshness(tableData, columnId, columnIdOrName);
   const columnName = column?.name || String(columnIdOrName || "");
-  const row = (tableData.rows || [])[0] || {};
+  const row = rowInput || (tableData.rows || [])[0] || {};
   const value = row?.values?.[columnName];
   return {
     columnName,
     actual: normalizeFreshnessValue(value),
   };
+}
+
+function normalizeFreshnessPresence(value) {
+  const normalized = String(value || "present").trim().toLowerCase();
+  if (["absent", "missing", "not_present", "not present", "removed", "false", "no"].includes(normalized)) {
+    return "absent";
+  }
+  return "present";
 }
 
 function normalizeReferenceName(value) {
@@ -644,7 +656,13 @@ async function executeSyncWorkflow(payload, eventLogger) {
   const freshnessExpectedValue = normalizeFreshnessValue(
     "expectedValue" in freshness ? freshness.expectedValue : payload.freshnessExpectedValue,
   );
-  const hasFreshnessAnchor = isRowSync && Boolean(freshnessColumnIdOrName);
+  const freshnessRowSelector = normalizeSelectorValue(freshness.rowSelector || payload.freshnessRowSelector || "");
+  const freshnessExpectedPresence = normalizeFreshnessPresence(
+    freshness.expectedPresence || payload.freshnessExpectedPresence,
+  );
+  const hasRowFreshnessAnchor = isRowSync && Boolean(freshnessColumnIdOrName);
+  const hasTableFreshnessAnchor = !isRowSync && Boolean(freshnessRowSelector);
+  const hasFreshnessAnchor = hasRowFreshnessAnchor || hasTableFreshnessAnchor;
   const freshnessMaxAttempts = parseIntEnv(
     freshness.maxAttempts ?? payload.freshnessMaxAttempts ?? process.env.CODA_FRESHNESS_RETRY_ATTEMPTS ?? 5,
     5,
@@ -679,7 +697,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
   }
 
   let resolvedFreshnessColumnId = freshnessColumnIdOrName;
-  if (hasFreshnessAnchor) {
+  if (freshnessColumnIdOrName) {
     resolvedFreshnessColumnId = await resolveColumnNameOrId(
       payload.docId,
       payload.tableIdOrName,
@@ -791,10 +809,11 @@ async function executeSyncWorkflow(payload, eventLogger) {
   let mappingResult;
   const maxSnapshotAttempts = Math.max(maxCodaStateRetries, hasFreshnessAnchor ? freshnessMaxAttempts : 1);
   let lastFreshnessActual = "";
+  let lastFreshnessPresence = "";
   for (let attempt = 1; attempt <= maxSnapshotAttempts; attempt += 1) {
     const tableData = await getCodaSnapshotData();
 
-    if (hasFreshnessAnchor) {
+    if (hasRowFreshnessAnchor) {
       const freshnessResult = getFreshnessValue(tableData, resolvedFreshnessColumnId, freshnessColumnIdOrName);
       lastFreshnessActual = freshnessResult.actual;
       const freshnessMatches = lastFreshnessActual === freshnessExpectedValue;
@@ -815,6 +834,57 @@ async function executeSyncWorkflow(payload, eventLogger) {
         if (attempt >= freshnessMaxAttempts) {
           throw new Error(
             `Coda API freshness check failed for "${freshnessColumnIdOrName}": expected "${freshnessExpectedValue}", got "${lastFreshnessActual}".`,
+          );
+        }
+        await sleep(freshnessDelayMs);
+        continue;
+      }
+    }
+
+    if (hasTableFreshnessAnchor) {
+      const matchedFreshnessRow = findRowBySelector(tableData, freshnessRowSelector, resolvedSlugFieldId);
+      lastFreshnessPresence = matchedFreshnessRow ? "present" : "absent";
+      const presenceMatches = lastFreshnessPresence === freshnessExpectedPresence;
+      let valueMatches = true;
+      let freshnessResult = null;
+
+      if (presenceMatches && matchedFreshnessRow && freshnessColumnIdOrName) {
+        freshnessResult = getFreshnessValue(
+          tableData,
+          resolvedFreshnessColumnId,
+          freshnessColumnIdOrName,
+          matchedFreshnessRow,
+        );
+        lastFreshnessActual = freshnessResult.actual;
+        valueMatches = lastFreshnessActual === freshnessExpectedValue;
+      }
+
+      const freshnessMatches = presenceMatches && valueMatches;
+      eventLogger(
+        freshnessMatches ? "info" : "warning",
+        "freshness",
+        freshnessMatches ? "Coda table freshness anchor matched" : "Coda table freshness anchor has not settled",
+        {
+          attempt,
+          maxAttempts: freshnessMaxAttempts,
+          selector: freshnessRowSelector,
+          expectedPresence: freshnessExpectedPresence,
+          actualPresence: lastFreshnessPresence,
+          column: freshnessResult?.columnName || freshnessColumnIdOrName || "",
+          expected: freshnessColumnIdOrName ? freshnessExpectedValue : "",
+          actual: freshnessColumnIdOrName ? lastFreshnessActual : "",
+        },
+      );
+
+      if (!freshnessMatches) {
+        if (attempt >= freshnessMaxAttempts) {
+          if (!presenceMatches) {
+            throw new Error(
+              `Coda table freshness check failed for "${freshnessRowSelector}": expected row to be ${freshnessExpectedPresence}, got ${lastFreshnessPresence}.`,
+            );
+          }
+          throw new Error(
+            `Coda table freshness check failed for "${freshnessColumnIdOrName}" on "${freshnessRowSelector}": expected "${freshnessExpectedValue}", got "${lastFreshnessActual}".`,
           );
         }
         await sleep(freshnessDelayMs);
