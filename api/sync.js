@@ -1552,20 +1552,24 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
         let sourceRowId = "";
         if (isApiRowId(sourceRowSelector)) {
           sourceRowId = sourceRowSelector;
+        } else if (resolvedSourceSlugFieldId) {
+          const queried = await getCodaRowByColumnValue(
+            statusDocId,
+            sourceBaseTableId,
+            resolvedSourceSlugFieldId,
+            sourceRowSelector,
+            codaApiToken,
+          );
+          const matchedSourceRow = findRowBySelector(queried, sourceRowSelector, resolvedSourceSlugFieldId);
+          sourceRowId = matchedSourceRow?.id || "";
         } else {
-          let sourceSlugFieldId = resolvedSourceSlugFieldId;
-
           const sourceTableData = await getCodaTableData(
             statusDocId,
             sourceBaseTableId,
             codaApiToken,
             callback.sourceStatusRowSearchLimit ?? 500,
           );
-          const matchedSourceRow = findRowBySelector(
-            sourceTableData,
-            sourceRowSelector,
-            sourceSlugFieldId,
-          );
+          const matchedSourceRow = findRowBySelector(sourceTableData, sourceRowSelector, "");
           sourceRowId = matchedSourceRow?.id || "";
         }
 
