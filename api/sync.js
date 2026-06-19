@@ -1473,7 +1473,9 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // added, ...) onto the row — e.g. logValues.Status = "completed" would
     // overwrite the workflow Status column. Only a separate log table should
     // receive them.
-    const isDedicatedLogTable = hasExplicitCallbackTable
+    const statusOnlyCallback = callback.statusOnly === true || callback.lightweight === true || callback.skipLogValues === true;
+    const isDedicatedLogTable = !statusOnlyCallback
+      && hasExplicitCallbackTable
       && Boolean(sourceBaseTableId)
       && resolvedStatusTableId !== sourceBaseTableId;
 
