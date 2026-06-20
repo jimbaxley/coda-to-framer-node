@@ -4,10 +4,7 @@ import {
   getCodaTableData,
   getCodaRowData,
   getCodaRowByColumnValue,
-  getCodaTableColumns,
   updateTableCell,
-  updateTableRowCells,
-  createTableRow,
   getCodaTableDataPaginated,
 } from "../lib/coda-client.js";
 import {
@@ -1308,35 +1305,6 @@ async function executeSyncWorkflow(payload, eventLogger) {
   return responseBody;
 }
 
-function buildCallbackLogValues(job, message) {
-  const events = Array.isArray(job?.events) ? job.events : [];
-  const latestEvent = events.length > 0 ? events[events.length - 1] : null;
-  return {
-    "Job id": job?.jobId || "",
-    "Created at": job?.createdAt || "",
-    Error: job?.error || "",
-    "Items added": Number(job?.result?.itemsAdded || 0),
-    Status: job?.status || "",
-    Message: String(message || job?.result?.message || ""),
-    Action: job?.payload?.action || "sync",
-    "Collection name": String(job?.payload?.collectionName || ""),
-    "Completed at": job?.completedAt || "",
-    "Deployment id": String(job?.result?.deploymentId || ""),
-    Id: job?.jobId || "",
-    "Items removed": Number(job?.result?.itemsRemoved || 0),
-    "Latest event": String(latestEvent?.message || ""),
-    "Latest stage": String(latestEvent?.stage || ""),
-    "Publish requested": Boolean(job?.payload?.publish),
-    Published: Boolean(job?.result?.published),
-    "Request id": job?.requestId || "",
-    "Source table": String(job?.payload?.tableIdOrName || ""),
-    "Started at": job?.startedAt || "",
-    "Updated at": job?.updatedAt || "",
-    Success: Boolean(job?.result?.success),
-  };
-}
-
-
 // When a status-cell update fails with a transient error, we spin up a
 // secondary job to retry the callback at a later time. This keeps the main
 // sync job from being marked as failed while still pushing the status row
@@ -1347,6 +1315,9 @@ function scheduleCallbackRetry(originalPayload, message, retryCount, eventLogger
     callback: originalPayload.callback || {},
     docId: originalPayload.docId,
     tableIdOrName: originalPayload.tableIdOrName,
+    rowId: originalPayload.rowId,
+    slugFieldId: originalPayload.slugFieldId,
+    callbackColumnIds: originalPayload.callbackColumnIds,
     callbackRetryCount: retryCount,
     retryMessage: message,
   };
@@ -1424,14 +1395,23 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     statusRowSelector = "";
   }
 
-  // Require doc/table/column — a row selector is optional. If none is
-  // provided (or cannot be resolved), create the final log row now.
+  // Require doc/table/column/row. Callback writes now only update an existing
+  // Server Status cell; they no longer create log rows or update extra fields.
   if (!statusColumnNameOrId || !statusTableIdOrName || !statusDocId) {
     eventLogger("warning", "callback", "Skipped Coda status callback: missing callback target", {
       hasStatusDocId: Boolean(statusDocId),
       hasStatusTableIdOrName: Boolean(statusTableIdOrName),
       hasStatusRowSelector: Boolean(statusRowSelector),
       hasStatusColumnNameOrId: Boolean(statusColumnNameOrId),
+    });
+    return;
+  }
+
+  if (!statusRowSelector) {
+    eventLogger("warning", "callback", "Skipped Coda status callback: missing target row", {
+      statusDocId,
+      statusTableIdOrName,
+      statusColumnNameOrId,
     });
     return;
   }
@@ -1468,365 +1448,75 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
   }
 
   try {
-    // Use pre-resolved table ID if available, otherwise resolve via API.
     const resolvedStatusTableId = cbPreresolvedTableId
       || await (async () => {
         const ref = await resolveTableCached(statusDocId, statusTableIdOrName, codaApiToken);
         return resolveBaseTableCached(statusDocId, ref, codaApiToken);
       })();
 
-    // Resolve status column, source base table (for log-table detection), and
-    // table columns all in parallel — none depend on each other.
-    const [resolvedStatusColumnId, sourceBaseTableId, tableColumns] = await Promise.all([
-      resolveCbColumn(statusColumnNameOrId)
-        ? Promise.resolve(resolveCbColumn(statusColumnNameOrId))
-        : resolveColumnCached(statusDocId, resolvedStatusTableId, statusColumnNameOrId, codaApiToken),
-      payload.tableIdOrName
-        ? resolveBaseTableCached(statusDocId, payload.tableIdOrName, codaApiToken).catch(() => "")
-        : Promise.resolve(""),
-      cbColumnIdMap.size > 0
-        ? Promise.resolve([...cbColumnIdMap.entries()].map(([name, id]) => ({ name, id })))
-        : getCodaTableColumns(statusDocId, resolvedStatusTableId, codaApiToken),
-    ]);
+    const resolvedStatusColumnId = resolveCbColumn(statusColumnNameOrId)
+      || await resolveColumnCached(statusDocId, resolvedStatusTableId, statusColumnNameOrId, codaApiToken);
 
-    // Distinguish a dedicated sync-log table from a write-back to the source
-    // row. deleteRow (and row-level sync) write status onto the source row, so
-    // the callback table resolves to the same base table as payload.tableIdOrName.
-    // In that case we must NOT splatter log values (Job id, Status, Items
-    // added, ...) onto the row — e.g. logValues.Status = "completed" would
-    // overwrite the workflow Status column. Only a separate log table should
-    // receive them.
-    const statusOnlyCallback = isSyncWithoutCallback || callback.statusOnly === true || callback.lightweight === true || callback.skipLogValues === true;
-    const isDedicatedLogTable = !statusOnlyCallback
-      && hasExplicitCallbackTable
-      && Boolean(sourceBaseTableId)
-      && resolvedStatusTableId !== sourceBaseTableId;
+    let resolvedStatusRowId = "";
+    if (isApiRowId(statusRowSelector)) {
+      resolvedStatusRowId = statusRowSelector;
+    } else {
+      let callbackSlugFieldId = callback.statusSlugField || callback.statusSlugFieldId || payload.slugFieldId || "";
+      if (callbackSlugFieldId) {
+        callbackSlugFieldId = resolveCbColumn(callbackSlugFieldId)
+          || await resolveColumnCached(statusDocId, resolvedStatusTableId, callbackSlugFieldId, codaApiToken);
+      }
 
-    const byLowerName = new Map(
-      tableColumns.map((column) => [String(column?.name || "").toLowerCase(), String(column?.id || "")]),
-    );
-
-    const messageColumnInput = callback.messageColumnId || callback.messageColumn || "";
-    let resolvedMessageColumnId = "";
-    if (messageColumnInput) {
-      try {
-        resolvedMessageColumnId = await resolveColumnCached(
+      if (callbackSlugFieldId) {
+        const queried = await getCodaRowByColumnValue(
           statusDocId,
           resolvedStatusTableId,
-          messageColumnInput,
+          callbackSlugFieldId,
+          statusRowSelector,
           codaApiToken,
         );
-      } catch (_) {
-        resolvedMessageColumnId = byLowerName.get("message") || "";
-      }
-    } else {
-      resolvedMessageColumnId = byLowerName.get("message") || "";
-    }
-
-    const jobData = jobSnapshot || {};
-    const logValues = buildCallbackLogValues(jobData, message);
-    const statusValue = String(jobData?.status || "").trim() || message;
-    const hasDedicatedMessageColumn = Boolean(resolvedMessageColumnId && resolvedMessageColumnId !== resolvedStatusColumnId);
-    const sourceStatusColumnInput = callback.sourceStatusColumnId || callback.sourceStatusColumn || "";
-
-    const writeSourceStatusMirror = async () => {
-      if (!isDedicatedLogTable || !sourceStatusColumnInput || !payload.tableIdOrName || !payload.rowId) {
-        return;
-      }
-
-      try {
-        const sourceRowSelector = String(payload.rowId || "").trim();
-        const needsSlugResolve = !isApiRowId(sourceRowSelector) && (payload.slugFieldId || "");
-
-        const [sourceStatusColumnId, resolvedSourceSlugFieldId] = await Promise.all([
-          resolveColumnCached(statusDocId, sourceBaseTableId, sourceStatusColumnInput, codaApiToken),
-          needsSlugResolve
-            ? resolveColumnCached(statusDocId, sourceBaseTableId, needsSlugResolve, codaApiToken)
-            : Promise.resolve(""),
-        ]);
-
-        let sourceRowId = "";
-        if (isApiRowId(sourceRowSelector)) {
-          sourceRowId = sourceRowSelector;
-        } else if (resolvedSourceSlugFieldId) {
-          const queried = await getCodaRowByColumnValue(
-            statusDocId,
-            sourceBaseTableId,
-            resolvedSourceSlugFieldId,
-            sourceRowSelector,
-            codaApiToken,
-          );
-          const matchedSourceRow = findRowBySelector(queried, sourceRowSelector, resolvedSourceSlugFieldId);
-          sourceRowId = matchedSourceRow?.id || "";
-        } else {
-          const sourceTableData = await getCodaTableData(
-            statusDocId,
-            sourceBaseTableId,
-            codaApiToken,
-            callback.sourceStatusRowSearchLimit ?? 500,
-          );
-          const matchedSourceRow = findRowBySelector(sourceTableData, sourceRowSelector, "");
-          sourceRowId = matchedSourceRow?.id || "";
-        }
-
-        if (!sourceRowId) {
-          eventLogger("warning", "callback", "Skipped source status mirror: source row not found", {
-            sourceTableIdOrName: sourceBaseTableId,
-            sourceRowSelector,
-            sourceStatusColumnInput,
-          });
-          return;
-        }
-
-        await updateTableCell(
-          statusDocId,
-          sourceBaseTableId,
-          sourceRowId,
-          sourceStatusColumnId,
-          message,
-          codaApiToken,
-        );
-        eventLogger("info", "callback", "Updated source status mirror", {
-          sourceTableIdOrName: sourceBaseTableId,
-          sourceRowSelector,
-          sourceRowId,
-          sourceStatusColumnInput,
-        });
-      } catch (mirrorError) {
-        eventLogger("warning", "callback", "Failed to update source status mirror", {
-          mirrorError: mirrorError instanceof Error ? mirrorError.message : String(mirrorError),
-          sourceTableIdOrName: sourceBaseTableId,
-          sourceRowSelector: String(payload.rowId || "").trim(),
-          sourceStatusColumnInput,
-        });
-      }
-    };
-
-    const cellsToUpdate = [];
-    cellsToUpdate.push({
-      column: resolvedStatusColumnId,
-      value: hasDedicatedMessageColumn ? statusValue : message,
-    });
-    if (hasDedicatedMessageColumn) {
-      cellsToUpdate.push({ column: resolvedMessageColumnId, value: message });
-    }
-    // Log values (job id, status, items added, etc.) are for dedicated sync
-    // log tables. Writing them to the source row (row-level sync / deleteRow)
-    // would corrupt workflow columns — e.g. "Status" in logValues = "published"
-    // would overwrite the Events table's workflow Status lookup column.
-    if (isDedicatedLogTable) {
-      for (const [columnName, value] of Object.entries(logValues)) {
-        const columnId = byLowerName.get(columnName.toLowerCase()) || "";
-        if (!columnId) continue;
-        if (columnId === resolvedStatusColumnId || columnId === resolvedMessageColumnId) continue;
-        cellsToUpdate.push({ column: columnId, value });
-      }
-    }
-
-    // Try to resolve an existing row if a selector was provided.
-    let resolvedStatusRowId = "";
-    if (statusRowSelector) {
-      if (isApiRowId(statusRowSelector)) {
-        resolvedStatusRowId = statusRowSelector;
+        const matchedRow = findRowBySelector(queried, statusRowSelector, callbackSlugFieldId);
+        resolvedStatusRowId = matchedRow?.id || "";
       } else {
-        let callbackSlugFieldId = callback.statusSlugField || callback.statusSlugFieldId || payload.slugFieldId || "";
-        if (callbackSlugFieldId) {
-          callbackSlugFieldId = resolveCbColumn(callbackSlugFieldId)
-            || await resolveColumnCached(statusDocId, resolvedStatusTableId, callbackSlugFieldId, codaApiToken);
-        }
-
-        const rowSearchLimit = parseIntEnv(
-          callback.statusRowSearchLimit ?? 500,
-          500,
-          1,
-          500,
-        );
-
+        const rowSearchLimit = parseIntEnv(callback.statusRowSearchLimit ?? 500, 500, 1, 500);
         const callbackTableData = await getCodaTableData(
           statusDocId,
           resolvedStatusTableId,
           codaApiToken,
           rowSearchLimit,
         );
-        const matchedRow = findRowBySelector(
-          callbackTableData,
-          statusRowSelector,
-          callbackSlugFieldId,
-        );
-        if (matchedRow?.id) {
-          resolvedStatusRowId = matchedRow.id;
-        }
+        const matchedRow = findRowBySelector(callbackTableData, statusRowSelector, "");
+        resolvedStatusRowId = matchedRow?.id || "";
       }
     }
 
-
-    // If no row was resolved, create a single final log row with ALL
-    // the collected cells (one-and-done). This avoids placeholder rows and
-    // eliminates the need to recreate or patch later.
-    let rowWasCreatedHere = false;
     if (!resolvedStatusRowId) {
-      if (statusOnlyCallback) {
-        eventLogger("warning", "callback", "Skipped status-only callback: no target row resolved", {
-          statusDocId,
-          statusTableIdOrName: resolvedStatusTableId,
-          statusRowSelector,
-          statusColumnNameOrId,
-        });
-        return;
-      }
-
-      // Run the source mirror write in parallel with the log row creation —
-      // they target different tables and are fully independent.
-      const [created] = await Promise.all([
-        createTableRow(statusDocId, resolvedStatusTableId, cellsToUpdate, codaApiToken),
-        writeSourceStatusMirror(),
-      ]);
-      resolvedStatusRowId = created.rowId || "";
-      if (resolvedStatusRowId) {
-        rowWasCreatedHere = true;
-        eventLogger("info", "callback", "callback_row_autocreated", {
-          statusDocId,
-          statusTableIdOrName: resolvedStatusTableId,
-          statusColumnNameOrId,
-          rowSelector: resolvedStatusRowId,
-          usedRowId: true,
-        });
-      }
-    }
-
-    // If we just created the full row above, we can stop here. the
-    // creation payload already contained every cell we care about, and
-    // issuing additional updates immediately afterwards is what was blowing
-    // Coda’s rate limit when a row is autocreated during a sync.
-    if (rowWasCreatedHere) {
-      eventLogger("info", "callback", "Callback row just created; skipping follow-on updates");
+      eventLogger("warning", "callback", "Skipped Coda status callback: target row not found", {
+        statusDocId,
+        statusTableIdOrName: resolvedStatusTableId,
+        statusRowSelector,
+        statusColumnNameOrId,
+      });
       return;
     }
 
-    // Otherwise, attempt a single-cell update for speed, and if that
-    // succeeds we’ll still run through the more robust row-update loop
-    // below to set everything. we still handle missing-row gracefully.
-    try {
-      await updateTableCell(
-        statusDocId,
-        resolvedStatusTableId,
-        resolvedStatusRowId,
-        resolvedStatusColumnId,
-        message,
-        codaApiToken,
-      );
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const isNotFound = (err && err.status === 404) || /404\s+Not\s+Found/i.test(errMsg) || /row not found/i.test(errMsg.toLowerCase());
-      if (isNotFound) {
-        // Row missing — log and continue; the robust row-update below will
-        // either populate or recreate the final log row as necessary.
-        eventLogger("info", "callback", "Callback row missing before single-cell update", {
-          statusDocId,
-          statusTableIdOrName: resolvedStatusTableId,
-          statusRowSelector,
-          resolvedStatusRowId,
-          statusColumnNameOrId,
-          resolvedStatusColumnId,
-          error: errMsg,
-        });
-      } else {
-        throw err;
-      }
-    }
-
-    // Attempt to update the row cells. Retry transient 404s that
-    // can occur immediately after row creation (eventual consistency).
-    const maxRowUpdateAttempts = parseIntEnv(process.env.CODA_CALLBACK_UPDATE_RETRY_ATTEMPTS || 5, 5, 1, 10);
-    let lastRowUpdateError = null;
-    for (let attempt = 1; attempt <= maxRowUpdateAttempts; attempt += 1) {
-      try {
-        await updateTableRowCells(
-          statusDocId,
-          resolvedStatusTableId,
-          resolvedStatusRowId,
-          cellsToUpdate,
-          codaApiToken,
-        );
-        lastRowUpdateError = null;
-        break;
-      } catch (rowErr) {
-        lastRowUpdateError = rowErr;
-        const msg = rowErr instanceof Error ? rowErr.message : String(rowErr);
-        const isNotFound = (rowErr && rowErr.status === 404) || /404\s+Not\s+Found/i.test(msg) || /row not found/i.test(msg.toLowerCase());
-        const retryable = isNotFound || isRetryableCodaError(rowErr);
-
-        eventLogger("warn", "callback", "Transient row-update failure", {
-          statusDocId,
-          resolvedStatusRowId,
-          attempt,
-          error: msg,
-          retryable,
-        });
-
-        if (!retryable) {
-          // this error is not one we think will resolve if retried
-          break;
-        }
-
-        // back off before trying again
-        await sleep(150 * attempt);
-
-        // If this was the last attempt, attempt special recovery for 404
-        if (attempt === maxRowUpdateAttempts && isNotFound) {
-          if (!rowWasCreatedHere) {
-            try {
-              const created = await createTableRow(
-                statusDocId,
-                resolvedStatusTableId,
-                // supply the same cells we intended to update
-                cellsToUpdate.map((c) => ({ column: c.column, value: c.value })),
-                codaApiToken,
-              );
-              const recreatedRowId = created.rowId || "";
-              if (recreatedRowId) {
-                resolvedStatusRowId = recreatedRowId;
-                eventLogger("info", "callback", "Recreated callback row with full cells", { recreatedRowId });
-                // Try updating again once more after recreate
-                await sleep(200);
-                await updateTableRowCells(
-                  statusDocId,
-                  resolvedStatusTableId,
-                  resolvedStatusRowId,
-                  cellsToUpdate,
-                  codaApiToken,
-                );
-
-                eventLogger("info", "callback", "Updated Coda status cell after recreate", {
-                  statusDocId,
-                  statusTableIdOrName: resolvedStatusTableId,
-                  statusRowSelector,
-                  resolvedStatusRowId,
-                  statusColumnNameOrId,
-                  resolvedStatusColumnId,
-                });
-                lastRowUpdateError = null;
-                break;
-              }
-            } catch (createErr) {
-              // fall through to final failure
-              lastRowUpdateError = createErr;
-            }
-          } else {
-            eventLogger("warn", "callback", "Skipping recreate of callback row because rowWasCreatedHere is true");
-          }
-        }
-      }
-    }
-
-    if (lastRowUpdateError) {
-      // if the final error is retryable (e.g. rate limit) we already logged a
-      // transient failure above. the caller will swallow the exception, but we
-      // surface the fact so that the job event contains the detail.
-      throw lastRowUpdateError instanceof Error ? lastRowUpdateError : new Error(String(lastRowUpdateError));
-    }
-
-    await writeSourceStatusMirror();
+    await updateTableCell(
+      statusDocId,
+      resolvedStatusTableId,
+      resolvedStatusRowId,
+      resolvedStatusColumnId,
+      message,
+      codaApiToken,
+      { waitForMutation: false },
+    );
+    eventLogger("info", "callback", "Updated Coda status cell", {
+      statusDocId,
+      statusTableIdOrName: resolvedStatusTableId,
+      statusRowSelector,
+      resolvedStatusRowId,
+      statusColumnNameOrId,
+      resolvedStatusColumnId,
+    });
   } catch (error) {
     const callbackError = error instanceof Error ? error.message : String(error);
     eventLogger("warning", "callback", "Failed to update Coda status cell", {
