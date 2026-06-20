@@ -1180,6 +1180,16 @@ async function executeSyncWorkflow(payload, eventLogger) {
         }
 
         let itemsToAdd = remapItems(framerMappingResult.items);
+        if (isRowSync && !collection.created) {
+          const allowedFieldIds = new Set(collectionFields.map((field) => field.id));
+          itemsToAdd = itemsToAdd.map((item) => {
+            const filteredFieldData = {};
+            for (const [fieldId, fieldValue] of Object.entries(item?.fieldData || {})) {
+              if (allowedFieldIds.has(fieldId)) filteredFieldData[fieldId] = fieldValue;
+            }
+            return { ...item, fieldData: filteredFieldData };
+          });
+        }
 
         // Add items with one retry on field-not-found after schema refresh
         let addItemsAttempted = false;
@@ -1211,23 +1221,6 @@ async function executeSyncWorkflow(payload, eventLogger) {
           }
         }
         if (!addItemsAttempted && addItemsError) throw addItemsError;
-
-        // rowSync path: filter to known field IDs and add again
-        if (isRowSync && !collection.created) {
-          const allowedFieldIds = new Set(collectionFields.map((f) => f.id));
-          itemsToAdd = framerMappingResult.items.map((item) => {
-            const filteredFieldData = {};
-            for (const [fieldId, fieldValue] of Object.entries(item?.fieldData || {})) {
-              if (allowedFieldIds.has(fieldId)) filteredFieldData[fieldId] = fieldValue;
-            }
-            return { ...item, fieldData: filteredFieldData };
-          });
-          await withTimeout(
-            collectionHandle.addItems(itemsToAdd),
-            timeoutMs,
-            "addItemsToCollection (rowSync)",
-          );
-        }
 
         // Verify items landed and reuse the same read for deleteMissing.
         try {
