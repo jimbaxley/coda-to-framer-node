@@ -7,9 +7,12 @@ export default async function handler(req, res) {
   }
 
   const API_SECRET_KEY = process.env.API_SECRET_KEY;
-  const clientKey = req.headers["x-api-key"];
-  if (!API_SECRET_KEY || clientKey !== API_SECRET_KEY) {
-    return sendJson(res, 401, { error: "UNAUTHORIZED", message: "Missing or invalid API key." });
+  if (API_SECRET_KEY) {
+    const authHeader = req.headers["authorization"] || "";
+    const clientKey = req.headers["x-api-key"] || authHeader.replace(/^Bearer\s+/i, "");
+    if (clientKey !== API_SECRET_KEY) {
+      return sendJson(res, 401, { error: "UNAUTHORIZED", message: "Missing or invalid API key." });
+    }
   }
 
   const codaApiToken = process.env.CODA_API_TOKEN;
