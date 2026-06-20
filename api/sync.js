@@ -293,6 +293,53 @@ function normalizeFreshnessValue(value) {
   return String(value).trim();
 }
 
+function normalizeFreshnessExpectedEntries(freshness, payload) {
+  const entries = [];
+  const expectedValues = freshness.expectedValues || payload.freshnessExpectedValues;
+
+  if (expectedValues && typeof expectedValues === "object") {
+    if (Array.isArray(expectedValues)) {
+      for (const entry of expectedValues) {
+        if (!entry || typeof entry !== "object") continue;
+        const columnIdOrName = String(entry.columnIdOrName || entry.column || entry.columnId || entry.columnName || "").trim();
+        if (!columnIdOrName) continue;
+        entries.push({
+          columnIdOrName,
+          expectedValue: normalizeFreshnessValue(entry.expectedValue ?? entry.value),
+        });
+      }
+    } else {
+      for (const [columnIdOrName, expectedValue] of Object.entries(expectedValues)) {
+        if (!String(columnIdOrName || "").trim()) continue;
+        entries.push({
+          columnIdOrName,
+          expectedValue: normalizeFreshnessValue(expectedValue),
+        });
+      }
+    }
+  }
+
+  const changedColumnIdOrName = String(
+    freshness.changedColumnIdOrName
+    || freshness.changedColumn
+    || payload.freshnessChangedColumnIdOrName
+    || payload.freshnessChangedColumn
+    || "",
+  ).trim();
+  if (changedColumnIdOrName) {
+    entries.push({
+      columnIdOrName: changedColumnIdOrName,
+      expectedValue: normalizeFreshnessValue(
+        "expectedChangedValue" in freshness
+          ? freshness.expectedChangedValue
+          : payload.freshnessExpectedChangedValue,
+      ),
+    });
+  }
+
+  return entries;
+}
+
 function findColumnForFreshness(tableData, columnId, columnIdOrName) {
   const normalizedColumnId = String(columnId || "").trim();
   const normalizedInput = String(columnIdOrName || "").trim().toLowerCase();
@@ -316,6 +363,21 @@ function getFreshnessValue(tableData, columnId, columnIdOrName, rowInput = null)
     columnName,
     actual: normalizeFreshnessValue(value),
   };
+}
+
+function getExpectedFreshnessResults(tableData, entries, rowInput = null) {
+  return entries.map((entry) => {
+    const result = getFreshnessValue(tableData, "", entry.columnIdOrName, rowInput);
+    const matches = result.actual === entry.expectedValue;
+    return {
+      column: result.columnName || entry.columnIdOrName,
+      matches,
+      expectedLength: entry.expectedValue.length,
+      actualLength: result.actual.length,
+      expectedPreview: entry.expectedValue.slice(0, 80),
+      actualPreview: result.actual.slice(0, 80),
+    };
+  });
 }
 
 function normalizeFreshnessPresence(value) {
@@ -692,7 +754,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
   const codaReadOptions = {
     requireLatest: parseBooleanFlag(
       requireLatestCodaSnapshotInput,
-      isRowSync,
+      false,
     ),
     latestRowsOnly: isRowSync,
   };
@@ -708,7 +770,9 @@ async function executeSyncWorkflow(payload, eventLogger) {
     freshness.expectedPresence || payload.freshnessExpectedPresence,
   );
   const freshnessMode = normalizeTableFreshnessMode(freshness.mode || payload.freshnessMode);
-  const hasRowFreshnessAnchor = isRowSync && Boolean(freshnessColumnIdOrName);
+  const rowExpectedFreshnessEntries = normalizeFreshnessExpectedEntries(freshness, payload);
+  const hasRowExpectedFreshness = isRowSync && rowExpectedFreshnessEntries.length > 0;
+  const hasRowFreshnessAnchor = isRowSync && (Boolean(freshnessColumnIdOrName) || hasRowExpectedFreshness);
   const hasTableRowFreshnessAnchor = !isRowSync && Boolean(freshnessRowSelector);
   const hasTableColumnFreshnessAnchor = !isRowSync && Boolean(freshnessColumnIdOrName) && !freshnessRowSelector;
   const hasTableFreshnessAnchor = hasTableRowFreshnessAnchor || hasTableColumnFreshnessAnchor;
@@ -729,7 +793,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
     requireLatest: codaReadOptions.requireLatest,
     latestRowsOnly: codaReadOptions.latestRowsOnly,
     hasFreshnessAnchor,
-    defaultedLatestForRowSync: isRowSync && requireLatestCodaSnapshotInput === undefined,
+    rowExpectedFreshnessCount: rowExpectedFreshnessEntries.length,
   });
 
   let resolvedFreshnessColumnId = freshnessColumnIdOrName;
@@ -884,9 +948,16 @@ async function executeSyncWorkflow(payload, eventLogger) {
     });
 
     if (hasRowFreshnessAnchor) {
-      const freshnessResult = getFreshnessValue(tableData, resolvedFreshnessColumnId, freshnessColumnIdOrName);
+      const freshnessResult = freshnessColumnIdOrName
+        ? getFreshnessValue(tableData, resolvedFreshnessColumnId, freshnessColumnIdOrName)
+        : { columnName: "", actual: "" };
       lastFreshnessActual = freshnessResult.actual;
-      const freshnessMatches = lastFreshnessActual === freshnessExpectedValue;
+      const statusFreshnessMatches = freshnessColumnIdOrName
+        ? lastFreshnessActual === freshnessExpectedValue
+        : true;
+      const expectedFreshnessResults = getExpectedFreshnessResults(tableData, rowExpectedFreshnessEntries);
+      const expectedFreshnessMatches = expectedFreshnessResults.every((result) => result.matches);
+      const freshnessMatches = statusFreshnessMatches && expectedFreshnessMatches;
       eventLogger(
         freshnessMatches ? "info" : "warning",
         "freshness",
@@ -897,11 +968,18 @@ async function executeSyncWorkflow(payload, eventLogger) {
           column: freshnessResult.columnName,
           expected: freshnessExpectedValue,
           actual: lastFreshnessActual,
+          expectedValues: expectedFreshnessResults,
         },
       );
 
       if (!freshnessMatches) {
         if (attempt >= freshnessMaxAttempts) {
+          const mismatch = expectedFreshnessResults.find((result) => !result.matches);
+          if (mismatch) {
+            throw new Error(
+              `Coda API freshness check failed for "${mismatch.column}": expected latest edited value, but Coda returned a different value.`,
+            );
+          }
           throw new Error(
             `Coda API freshness check failed for "${freshnessColumnIdOrName}": expected "${freshnessExpectedValue}", got "${lastFreshnessActual}".`,
           );
