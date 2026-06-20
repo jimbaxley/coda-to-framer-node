@@ -1388,6 +1388,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
     publishRequested,
     collectionId: collection.collectionId,
     collectionName: collection.collectionName,
+    sourceRowId: isRowSync ? String(mappingResult.items?.[0]?.id || "") : "",
     itemsAdded: framerMappingResult.items.length,
     itemsRemoved,
     fieldsSet,
@@ -1558,8 +1559,23 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       || await resolveColumnCached(statusDocId, resolvedStatusTableId, statusColumnNameOrId, codaApiToken);
 
     let resolvedStatusRowId = "";
+    const reusableSourceRowId = String(
+      payload.sourceRowId
+      || jobSnapshot?.result?.sourceRowId
+      || "",
+    );
     if (isApiRowId(statusRowSelector)) {
       resolvedStatusRowId = statusRowSelector;
+    } else if (
+      reusableSourceRowId
+      && isApiRowId(reusableSourceRowId)
+      && normalizeSelectorValue(statusRowSelector) === normalizeSelectorValue(payload.rowId)
+    ) {
+      resolvedStatusRowId = reusableSourceRowId;
+      eventLogger("info", "callback", "Reused source row ID for status callback", {
+        statusRowSelector,
+        resolvedStatusRowId,
+      });
     } else {
       let callbackSlugFieldId = callback.statusSlugField || callback.statusSlugFieldId || payload.slugFieldId || "";
       if (callbackSlugFieldId) {
