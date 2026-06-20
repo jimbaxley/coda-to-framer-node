@@ -1652,12 +1652,8 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       } else {
         let callbackSlugFieldId = callback.statusSlugField || callback.statusSlugFieldId || payload.slugFieldId || "";
         if (callbackSlugFieldId) {
-          callbackSlugFieldId = await resolveColumnCached(
-            statusDocId,
-            resolvedStatusTableId,
-            callbackSlugFieldId,
-            codaApiToken,
-          );
+          callbackSlugFieldId = resolveCbColumn(callbackSlugFieldId)
+            || await resolveColumnCached(statusDocId, resolvedStatusTableId, callbackSlugFieldId, codaApiToken);
         }
 
         const rowSearchLimit = parseIntEnv(
