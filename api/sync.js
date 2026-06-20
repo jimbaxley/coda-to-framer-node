@@ -867,7 +867,15 @@ async function executeSyncWorkflow(payload, eventLogger) {
   let lastFreshnessPresence = "";
   let lastTableFreshnessSignature = "";
   for (let attempt = 1; attempt <= maxSnapshotAttempts; attempt += 1) {
+    const snapshotStartedAt = Date.now();
     const tableData = await getCodaSnapshotData();
+    eventLogger("info", "extract", "Fetched Coda snapshot", {
+      attempt,
+      maxAttempts: maxSnapshotAttempts,
+      rowCount: Array.isArray(tableData?.rows) ? tableData.rows.length : 0,
+      columnCount: Array.isArray(tableData?.columns) ? tableData.columns.length : 0,
+      elapsedMs: Date.now() - snapshotStartedAt,
+    });
 
     if (hasRowFreshnessAnchor) {
       const freshnessResult = getFreshnessValue(tableData, resolvedFreshnessColumnId, freshnessColumnIdOrName);
@@ -990,7 +998,15 @@ async function executeSyncWorkflow(payload, eventLogger) {
       }
     }
 
+    const mappingStartedAt = Date.now();
     mappingResult = await buildMappingFromTableData(tableData);
+    eventLogger("info", "extract", "Mapped Coda snapshot", {
+      attempt,
+      itemCount: mappingResult.items.length,
+      fieldCount: mappingResult.fields.length,
+      warningCount: mappingResult.warnings.length,
+      elapsedMs: Date.now() - mappingStartedAt,
+    });
 
     const retryableWarning = shouldRetryForTransientCodaWarnings(mappingResult.warnings);
     if (!retryableWarning || attempt === maxSnapshotAttempts) {
