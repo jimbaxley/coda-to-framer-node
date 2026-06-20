@@ -686,11 +686,15 @@ async function executeSyncWorkflow(payload, eventLogger) {
   }
 
   let resolvedSlugFieldId = payload.slugFieldId;
+  const requireLatestCodaSnapshotInput = payload.requireLatestCodaSnapshot
+    ?? (isRowSync ? process.env.CODA_ROW_REQUIRE_LATEST_SOURCE_READS : undefined)
+    ?? process.env.CODA_REQUIRE_LATEST_SOURCE_READS;
   const codaReadOptions = {
     requireLatest: parseBooleanFlag(
-      payload.requireLatestCodaSnapshot ?? process.env.CODA_REQUIRE_LATEST_SOURCE_READS,
-      false,
+      requireLatestCodaSnapshotInput,
+      isRowSync,
     ),
+    latestRowsOnly: isRowSync,
   };
   const freshness = payload.freshness && typeof payload.freshness === "object"
     ? payload.freshness
@@ -723,7 +727,9 @@ async function executeSyncWorkflow(payload, eventLogger) {
   );
   eventLogger("info", "extract", "Configured Coda snapshot read mode", {
     requireLatest: codaReadOptions.requireLatest,
+    latestRowsOnly: codaReadOptions.latestRowsOnly,
     hasFreshnessAnchor,
+    defaultedLatestForRowSync: isRowSync && requireLatestCodaSnapshotInput === undefined,
   });
 
   let resolvedFreshnessColumnId = freshnessColumnIdOrName;
