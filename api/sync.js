@@ -667,6 +667,27 @@ async function executeSyncWorkflow(payload, eventLogger) {
     throw new Error("Missing required field for rowSync: rowId");
   }
 
+  // Parse the pre-resolved columnIds string (e.g. "Slug:c-abc,Graphic:c-xyz") into a
+  // lookup map so we can skip live Coda API resolution for known column names.
+  const columnIdMap = new Map();
+  if (payload.columnIds) {
+    for (const entry of String(payload.columnIds).split(",")) {
+      const colon = entry.indexOf(":");
+      if (colon > 0) {
+        const name = entry.slice(0, colon).trim();
+        const id = entry.slice(colon + 1).trim();
+        if (name && id) columnIdMap.set(name.toLowerCase(), id);
+      }
+    }
+  }
+
+  function resolveColumnFromMap(nameOrId) {
+    if (!nameOrId) return null;
+    // Already a column ID — nothing to resolve.
+    if (/^c-[A-Za-z0-9_-]+$/.test(String(nameOrId))) return nameOrId;
+    return columnIdMap.get(String(nameOrId).toLowerCase()) || null;
+  }
+
   let resolvedSlugFieldId = payload.slugFieldId;
   const codaReadOptions = {
     requireLatest: parseBooleanFlag(
@@ -711,10 +732,10 @@ async function executeSyncWorkflow(payload, eventLogger) {
   let resolvedFreshnessColumnId = freshnessColumnIdOrName;
   [resolvedSlugFieldId, resolvedFreshnessColumnId] = await Promise.all([
     payload.slugFieldId
-      ? resolveColumnCached(payload.docId, payload.tableIdOrName, payload.slugFieldId, codaApiToken, codaReadOptions)
+      ? (resolveColumnFromMap(payload.slugFieldId) || resolveColumnCached(payload.docId, payload.tableIdOrName, payload.slugFieldId, codaApiToken, codaReadOptions))
       : Promise.resolve(resolvedSlugFieldId),
     freshnessColumnIdOrName
-      ? resolveColumnCached(payload.docId, payload.tableIdOrName, freshnessColumnIdOrName, codaApiToken, codaReadOptions)
+      ? (resolveColumnFromMap(freshnessColumnIdOrName) || resolveColumnCached(payload.docId, payload.tableIdOrName, freshnessColumnIdOrName, codaApiToken, codaReadOptions))
       : Promise.resolve(resolvedFreshnessColumnId),
   ]);
 
