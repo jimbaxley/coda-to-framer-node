@@ -68,6 +68,15 @@ export function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+const DEFAULT_CALLBACK_COLLECTION_ID_COLUMN_ID = "c-JeQ60MRLJR";
+
+function getCallbackCollectionIdColumnId() {
+  return String(
+    process.env.CODA_CALLBACK_COLLECTION_ID_COLUMN_ID
+    || DEFAULT_CALLBACK_COLLECTION_ID_COLUMN_ID,
+  ).trim();
+}
+
 function log(level, event, fields = {}) {
   const record = {
     ts: new Date().toISOString(),
@@ -1137,6 +1146,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
   let publishResult = null;
   let publishError = "";
   const publishRequested = Boolean(payload.publish);
+  const cachedCollection = await readCallbackCollectionId(payload, codaApiToken, eventLogger);
 
   await runSyncSession(
     payload.framerProjectUrl,
@@ -1144,28 +1154,37 @@ async function executeSyncWorkflow(payload, eventLogger) {
     payload.collectionName,
     async ({ framer, collection: collectionHandle, collectionMeta, timeoutMs }) => {
       collection = collectionMeta;
+      payload.resolvedCollectionId = collection.collectionId;
+      let activeCollectionHandle = collectionHandle;
+
+      async function refreshCollectionHandle(operationName, attempts = 3, delayMs = 1000) {
+        let refreshedCollection = null;
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+          const refreshed = await withTimeout(
+            framer.getManagedCollections(),
+            timeoutMs,
+            `${operationName} getManagedCollections`,
+          );
+          refreshedCollection = refreshed.find((item) => item.id === collection.collectionId) || null;
+          if (refreshedCollection) {
+            activeCollectionHandle = refreshedCollection;
+            return refreshedCollection;
+          }
+          if (attempt < attempts) await sleep(delayMs);
+        }
+        return null;
+      }
+
+      function shouldRefreshCollectionHandle(error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return /expected a collection node|managed collection not found|collection not found/i.test(message);
+      }
 
       // If collection was just created but not found, poll within the same session
       if (collection.created && collection.foundAfterCreate === false) {
         const pollAttempts = 5;
         const pollDelayMs = 1000;
-        let found = false;
-        for (let i = 0; i < pollAttempts; i++) {
-          try {
-            const refreshed = await withTimeout(
-              framer.getManagedCollections(),
-              timeoutMs,
-              "getManagedCollections (poll)",
-            );
-            if (refreshed.find((item) => item.id === collection.collectionId)) {
-              found = true;
-              break;
-            }
-          } catch {
-            // ignore, will retry
-          }
-          await sleep(pollDelayMs);
-        }
+        const found = await refreshCollectionHandle("getManagedCollections (poll)", pollAttempts, pollDelayMs);
         if (!found) {
           eventLogger("error", "framer_sync", "Collection not found after polling", { collectionName: collection.collectionName });
           throw new Error(`Managed collection not found after creation and polling: ${collection.collectionName}`);
@@ -1173,7 +1192,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
       }
 
       async function fetchItemIds(operationName) {
-        if (typeof collectionHandle.getItemIds !== "function") return [];
+        if (typeof activeCollectionHandle.getItemIds !== "function") return [];
 
         const maxAttempts = parseIntEnv(process.env.FRAMER_RETRY_ATTEMPTS || 3, 3, 1, 6);
         const baseDelayMs = parseIntEnv(process.env.FRAMER_RETRY_DELAY_MS || 1000, 1000, 0, 10000);
@@ -1182,13 +1201,22 @@ async function executeSyncWorkflow(payload, eventLogger) {
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           try {
             const ids = await withTimeout(
-              collectionHandle.getItemIds(),
+              activeCollectionHandle.getItemIds(),
               timeoutMs,
               operationName,
             );
             return Array.isArray(ids) ? ids.map((id) => String(id)) : [];
           } catch (error) {
             lastError = error;
+            if (shouldRefreshCollectionHandle(error)) {
+              eventLogger("warning", "framer_sync", "Refreshing collection handle after item id read error", {
+                operationName,
+                attempt,
+                message: error instanceof Error ? error.message : String(error),
+              });
+              await refreshCollectionHandle(`${operationName} refresh`);
+              continue;
+            }
             if (!isRetryableFramerError(error) || attempt === maxAttempts) {
               break;
             }
@@ -1214,7 +1242,30 @@ async function executeSyncWorkflow(payload, eventLogger) {
       let prefetchedItemIds = null;
       if (!isRowSync || collection.created) {
         const compatibleFields = framerMappingResult.fields.filter(Boolean);
-        await withTimeout(collectionHandle.setFields(compatibleFields), timeoutMs, "setCollectionFields");
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            eventLogger("info", "framer_sync", "Setting managed collection fields", {
+              collectionName: collection.collectionName,
+              collectionId: collection.collectionId,
+              fieldCount: compatibleFields.length,
+              attempt,
+            });
+            await withTimeout(activeCollectionHandle.setFields(compatibleFields), timeoutMs, "setCollectionFields");
+            break;
+          } catch (error) {
+            if (attempt >= 3 || !shouldRefreshCollectionHandle(error)) {
+              throw error;
+            }
+            eventLogger("warning", "framer_sync", "Refreshing collection handle after setFields error", {
+              collectionName: collection.collectionName,
+              collectionId: collection.collectionId,
+              attempt,
+              message: error instanceof Error ? error.message : String(error),
+            });
+            await refreshCollectionHandle("setCollectionFields refresh");
+            await sleep(1000);
+          }
+        }
         fieldsSet = compatibleFields.length;
       }
 
@@ -1223,7 +1274,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
         if (itemId) {
           try {
             await withTimeout(
-              collectionHandle.removeItems([itemId]),
+              activeCollectionHandle.removeItems([itemId]),
               timeoutMs,
               "removeCompletedItemFromCollection (rowSync)",
             );
@@ -1248,10 +1299,10 @@ async function executeSyncWorkflow(payload, eventLogger) {
         );
 
         async function fetchFields() {
-          let normalized = normalizeCollectionFieldsLocal(collectionHandle?.fields);
+          let normalized = normalizeCollectionFieldsLocal(activeCollectionHandle?.fields);
           if (normalized.length > 0) return normalized;
-          if (typeof collectionHandle.getFields === "function") {
-            const fetched = await withTimeout(collectionHandle.getFields(), timeoutMs, "getCollectionFields");
+          if (typeof activeCollectionHandle.getFields === "function") {
+            const fetched = await withTimeout(activeCollectionHandle.getFields(), timeoutMs, "getCollectionFields");
             normalized = normalizeCollectionFieldsLocal(fetched);
           }
           return normalized;
@@ -1288,13 +1339,14 @@ async function executeSyncWorkflow(payload, eventLogger) {
           });
         }
 
-        // Add items with one retry on field-not-found after schema refresh
+        // Add items with one retry on field-not-found or stale collection handle.
+        // Keep the optimized bulk write as the normal path.
         let addItemsAttempted = false;
         let addItemsError = null;
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
             await withTimeout(
-              collectionHandle.addItems(itemsToAdd),
+              activeCollectionHandle.addItems(itemsToAdd),
               timeoutMs,
               "addItemsToCollection (bulk)",
             );
@@ -1303,9 +1355,10 @@ async function executeSyncWorkflow(payload, eventLogger) {
           } catch (err) {
             addItemsError = err;
             const msg = String(err?.message ?? err);
-            if (attempt === 0 && collection.created && /field not found/i.test(msg)) {
-              eventLogger("warning", "framer_sync", "Retrying addItems after collection creation and schema refresh", { msg });
+            if (attempt === 0 && (collection.created || shouldRefreshCollectionHandle(err) || /field not found/i.test(msg))) {
+              eventLogger("warning", "framer_sync", "Retrying addItems after collection handle/schema refresh", { msg });
               await sleep(1500);
+              await refreshCollectionHandle("addItemsToCollection refresh");
               collectionFields = await fetchFields();
               collectionFieldNameToId = new Map(
                 collectionFields.map((field) => [String(field.name).toLowerCase(), field.id]),
@@ -1321,7 +1374,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
         // Verify items landed and reuse the same read for deleteMissing.
         try {
-          if (!isRowSync && typeof collectionHandle.getItemIds === "function") {
+          if (!isRowSync && typeof activeCollectionHandle.getItemIds === "function") {
             managedItemIdsAfterAdd = await fetchItemIds("getManagedCollectionItemIds (after add)");
             const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
             const afterSet = new Set(managedItemIdsAfterAdd);
@@ -1342,13 +1395,13 @@ async function executeSyncWorkflow(payload, eventLogger) {
       if (!isRowSync && payload.deleteMissing) {
         const codaItemIds = new Set(framerMappingResult.items.map((item) => String(item.id)));
         let managedItemIds = managedItemIdsAfterAdd ?? [];
-        if (managedItemIdsAfterAdd === null && typeof collectionHandle.getItemIds === "function") {
+        if (managedItemIdsAfterAdd === null && typeof activeCollectionHandle.getItemIds === "function") {
           managedItemIds = await fetchItemIds("getManagedCollectionItemIds (deleteMissing)");
         }
         const toRemove = managedItemIds.filter((id) => !codaItemIds.has(id));
         if (toRemove.length > 0) {
           await withTimeout(
-            collectionHandle.removeItems(toRemove),
+            activeCollectionHandle.removeItems(toRemove),
             timeoutMs,
             "removeManagedCollectionItems",
           );
@@ -1356,6 +1409,10 @@ async function executeSyncWorkflow(payload, eventLogger) {
         }
       }
 
+    },
+    {
+      collectionId: cachedCollection.collectionId,
+      assumeNew: cachedCollection.assumeNew,
     },
   );
 
@@ -1418,6 +1475,7 @@ function scheduleCallbackRetry(originalPayload, message, retryCount, eventLogger
     tableIdOrName: originalPayload.tableIdOrName,
     rowId: originalPayload.rowId,
     slugFieldId: originalPayload.slugFieldId,
+    resolvedCollectionId: originalPayload.resolvedCollectionId,
     callbackColumnIds: originalPayload.callbackColumnIds,
     callbackRetryCount: retryCount,
     retryMessage: message,
@@ -1441,6 +1499,224 @@ function scheduleCallbackRetry(originalPayload, message, retryCount, eventLogger
   } else {
     // best effort; the original invocation may die but this gives it a chance
     setTimeout(run, 1000 * 10);
+  }
+}
+
+function getCallbackTargetInputs(payload) {
+  const callback = payload.callback || {};
+  const hasCallbackPayload = Boolean(payload.callback && Object.keys(callback).length > 0);
+  const isSyncWithoutCallback = !hasCallbackPayload && String(payload.action || "sync") === "sync";
+  const hasExplicitCallbackTable = Object.prototype.hasOwnProperty.call(callback, "statusTableIdOrName")
+    || Object.prototype.hasOwnProperty.call(callback, "statusTableInput");
+  const defaultCallbackTableName = getDefaultCallbackTableName();
+  const rawStatusColumnNameOrId = callback.statusColumn || callback.statusColumnId || callback.statusColumnNameOrId || "Server Status";
+  const rawStatusRowSelector = callback.statusRow || callback.statusRowId || callback.statusRowSelector || payload.rowId || "";
+  const rawStatusTableIdOrName = callback.statusTableIdOrName
+    || callback.statusTableInput
+    || (isSyncWithoutCallback ? "FramerSync" : (hasExplicitCallbackTable ? defaultCallbackTableName : (payload.tableIdOrName || "")));
+  const statusDocId = callback.statusDocId || payload.docId || "";
+
+  const looksLikeUnknownObject = (value) => {
+    const text = String(value || "").trim().toLowerCase();
+    return text.includes("[unknown object]") || text === "[object object]";
+  };
+
+  const extractCodaId = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return "";
+    const rowMatch = text.match(/(?:\/rows\/|\b)(i-[A-Za-z0-9_-]+)\b/);
+    if (rowMatch?.[1]) return rowMatch[1];
+    const tableMatch = text.match(/\b(grid-[A-Za-z0-9_-]+)\b/);
+    if (tableMatch?.[1]) return tableMatch[1];
+    const columnMatch = text.match(/\b(c-[A-Za-z0-9_-]+)\b/);
+    if (columnMatch?.[1]) return columnMatch[1];
+    return "";
+  };
+
+  let statusRowSelector = String(rawStatusRowSelector || "").trim();
+  let statusTableIdOrName = String(rawStatusTableIdOrName || "").trim();
+
+  if (looksLikeUnknownObject(statusTableIdOrName)) {
+    statusTableIdOrName = hasExplicitCallbackTable
+      ? String(defaultCallbackTableName || "").trim()
+      : String(payload.tableIdOrName || "").trim();
+  }
+
+  if (looksLikeUnknownObject(statusRowSelector)) {
+    statusRowSelector = "";
+  }
+
+  const extractedRowId = extractCodaId(statusRowSelector);
+  if (extractedRowId && isApiRowId(extractedRowId)) {
+    statusRowSelector = extractedRowId;
+  } else if (/^https?:\/\//i.test(statusRowSelector)) {
+    statusRowSelector = "";
+  }
+
+  return {
+    callback,
+    statusDocId,
+    statusTableIdOrName,
+    statusColumnNameOrId: String(rawStatusColumnNameOrId || "").trim(),
+    statusRowSelector,
+  };
+}
+
+function parseCallbackColumnIds(payload) {
+  const cbColumnIdMap = new Map();
+  let cbPreresolvedTableId = "";
+  if (payload.callbackColumnIds) {
+    const raw = String(payload.callbackColumnIds);
+    const pipeIdx = raw.indexOf("|");
+    const colPart = pipeIdx > 0 ? raw.slice(pipeIdx + 1) : raw;
+    if (pipeIdx > 0) cbPreresolvedTableId = raw.slice(0, pipeIdx).trim();
+    for (const entry of colPart.split(",")) {
+      const colon = entry.indexOf(":");
+      if (colon > 0) {
+        const name = entry.slice(0, colon).trim();
+        const id = entry.slice(colon + 1).trim();
+        if (name && id) cbColumnIdMap.set(name.toLowerCase(), id);
+      }
+    }
+  }
+
+  function resolveCbColumn(nameOrId) {
+    if (!nameOrId) return null;
+    if (/^c-[A-Za-z0-9_-]+$/.test(String(nameOrId))) return nameOrId;
+    return cbColumnIdMap.get(String(nameOrId).toLowerCase()) || null;
+  }
+
+  return { cbPreresolvedTableId, resolveCbColumn };
+}
+
+async function resolveCallbackRowForCollectionId(payload, codaApiToken, eventLogger) {
+  const {
+    callback,
+    statusDocId,
+    statusTableIdOrName,
+    statusRowSelector,
+  } = getCallbackTargetInputs(payload);
+
+  if (!statusDocId || !statusTableIdOrName || !statusRowSelector) {
+    return null;
+  }
+
+  const { cbPreresolvedTableId, resolveCbColumn } = parseCallbackColumnIds(payload);
+  const resolvedStatusTableId = cbPreresolvedTableId
+    || await (async () => {
+      const ref = await resolveTableCached(statusDocId, statusTableIdOrName, codaApiToken);
+      return resolveBaseTableCached(statusDocId, ref, codaApiToken);
+    })();
+
+  let matchedRow = null;
+  let callbackTableData = null;
+  if (isApiRowId(statusRowSelector)) {
+    callbackTableData = await getCodaRowData(
+      statusDocId,
+      resolvedStatusTableId,
+      statusRowSelector,
+      codaApiToken,
+    );
+    matchedRow = callbackTableData.rows[0] || null;
+  } else {
+    let callbackSlugFieldId = callback.statusSlugField || callback.statusSlugFieldId || payload.slugFieldId || "";
+    if (callbackSlugFieldId) {
+      callbackSlugFieldId = resolveCbColumn(callbackSlugFieldId)
+        || await resolveColumnCached(statusDocId, resolvedStatusTableId, callbackSlugFieldId, codaApiToken);
+    }
+
+    if (callbackSlugFieldId) {
+      callbackTableData = await getCodaRowByColumnValue(
+        statusDocId,
+        resolvedStatusTableId,
+        callbackSlugFieldId,
+        statusRowSelector,
+        codaApiToken,
+      );
+      matchedRow = findRowBySelector(callbackTableData, statusRowSelector, callbackSlugFieldId);
+    } else {
+      const rowSearchLimit = parseIntEnv(callback.statusRowSearchLimit ?? 500, 500, 1, 500);
+      callbackTableData = await getCodaTableData(
+        statusDocId,
+        resolvedStatusTableId,
+        codaApiToken,
+        rowSearchLimit,
+      );
+      matchedRow = findRowBySelector(callbackTableData, statusRowSelector, "");
+    }
+  }
+
+  if (!matchedRow) {
+    eventLogger("warning", "callback", "Could not find callback row for cached collection ID", {
+      statusDocId,
+      statusTableIdOrName: resolvedStatusTableId,
+      statusRowSelector,
+    });
+    return null;
+  }
+
+  return { callbackTableData, matchedRow, resolvedStatusTableId };
+}
+
+function extractCallbackCollectionId(callbackTableData, row, collectionIdColumnId) {
+  if (!row?.values) return "";
+  const column = callbackTableData?.columns?.find((item) => String(item?.id || "") === collectionIdColumnId);
+  const keys = [
+    column?.name,
+    "CollectionID",
+    "Collection ID",
+    "Collection Id",
+    "collectionId",
+  ].filter(Boolean);
+
+  for (const key of keys) {
+    const value = normalizeSelectorValue(row.values[key]);
+    if (value) return value;
+  }
+
+  for (const [key, rawValue] of Object.entries(row.values)) {
+    const normalizedKey = String(key || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (normalizedKey === "collectionid") {
+      const value = normalizeSelectorValue(rawValue);
+      if (value) return value;
+    }
+  }
+
+  return "";
+}
+
+async function readCallbackCollectionId(payload, codaApiToken, eventLogger) {
+  const collectionIdColumnId = getCallbackCollectionIdColumnId();
+  if (!collectionIdColumnId) return { collectionId: "", assumeNew: false };
+
+  try {
+    const target = await resolveCallbackRowForCollectionId(payload, codaApiToken, eventLogger);
+    if (!target) {
+      return { collectionId: "", assumeNew: false };
+    }
+    const collectionId = extractCallbackCollectionId(
+      target?.callbackTableData,
+      target?.matchedRow,
+      collectionIdColumnId,
+    );
+    if (collectionId) {
+      eventLogger("info", "callback", "Read cached Framer collection ID from Coda", {
+        collectionId,
+        collectionIdColumnId,
+      });
+      return { collectionId, assumeNew: false };
+    } else {
+      eventLogger("info", "callback", "No cached Framer collection ID on callback row; using new-collection path", {
+        collectionIdColumnId,
+      });
+      return { collectionId: "", assumeNew: true };
+    }
+  } catch (error) {
+    eventLogger("warning", "callback", "Could not read cached Framer collection ID; falling back to name resolution", {
+      collectionIdColumnId,
+      callbackError: error instanceof Error ? error.message : String(error),
+    });
+    return { collectionId: "", assumeNew: false };
   }
 }
 
@@ -1633,6 +1909,33 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       statusColumnNameOrId,
       resolvedStatusColumnId,
     });
+
+    const collectionIdColumnId = getCallbackCollectionIdColumnId();
+    const resolvedCollectionId = String(
+      payload.resolvedCollectionId
+      || jobSnapshot?.result?.collectionId
+      || payload.collectionId
+      || "",
+    ).trim();
+    if (collectionIdColumnId && resolvedCollectionId) {
+      await updateTableCell(
+        statusDocId,
+        resolvedStatusTableId,
+        resolvedStatusRowId,
+        collectionIdColumnId,
+        resolvedCollectionId,
+        codaApiToken,
+        { waitForMutation: false },
+      );
+      eventLogger("info", "callback", "Updated Coda collection ID cell", {
+        statusDocId,
+        statusTableIdOrName: resolvedStatusTableId,
+        statusRowSelector,
+        resolvedStatusRowId,
+        collectionIdColumnId,
+        collectionId: resolvedCollectionId,
+      });
+    }
   } catch (error) {
     const callbackError = error instanceof Error ? error.message : String(error);
     eventLogger("warning", "callback", "Failed to update Coda status cell", {
