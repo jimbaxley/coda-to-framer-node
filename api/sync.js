@@ -1141,21 +1141,9 @@ async function executeSyncWorkflow(payload, eventLogger) {
         }
       }
 
+      let managedItemIdsAfterAdd = null;
+
       if (framerMappingResult.items.length > 0) {
-        let existingItemIds = [];
-        // Skip getItemIds for rowSync — it's only needed for post-add verification
-        // and deleteMissing (fullSync only). On flaky Framer connections it causes
-        // "Connection closed" errors that burn through all retries and fail the job.
-        if (!isRowSync) {
-          try {
-            if (typeof collectionHandle.getItemIds === "function") {
-              existingItemIds = await fetchItemIds("getManagedCollectionItemIds (before add)");
-            }
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            eventLogger("warning", "framer_sync", "Could not fetch existing item ids before add", { message });
-          }
-        }
 
         // Fetch collection fields for remapping (use object fields first, fall back to getFields)
         const codaFieldIdToName = new Map(
@@ -1241,17 +1229,15 @@ async function executeSyncWorkflow(payload, eventLogger) {
           );
         }
 
-        // Verify items landed (fullSync only — skip for rowSync to avoid flaky getItemIds calls)
+        // Verify items landed and reuse the same read for deleteMissing.
         try {
           if (!isRowSync && typeof collectionHandle.getItemIds === "function") {
-            const afterIds = await fetchItemIds("getManagedCollectionItemIds (after add)");
-            const beforeSet = new Set(existingItemIds);
+            managedItemIdsAfterAdd = await fetchItemIds("getManagedCollectionItemIds (after add)");
             const submittedIds = new Set(itemsToAdd.map((item) => String(item.id)));
-            const expectedNewIds = Array.from(submittedIds).filter((id) => !beforeSet.has(id));
-            const afterSet = new Set(afterIds);
-            const missingNewIds = expectedNewIds.filter((id) => !afterSet.has(id));
+            const afterSet = new Set(managedItemIdsAfterAdd);
+            const missingNewIds = Array.from(submittedIds).filter((id) => !afterSet.has(id));
             if (missingNewIds.length > 0) {
-              const warning = `Submitted ${itemsToAdd.length} items, but ${missingNewIds.length} expected new id(s) were not present after add: ${missingNewIds.join(", ")}`;
+              const warning = `Submitted ${itemsToAdd.length} items, but ${missingNewIds.length} submitted id(s) were not present after add: ${missingNewIds.join(", ")}`;
               mappingResult.warnings.push(warning);
               eventLogger("warning", "framer_sync", "Some submitted item IDs were not visible after add", { missingNewIds });
             }
@@ -1265,8 +1251,8 @@ async function executeSyncWorkflow(payload, eventLogger) {
       // Delete missing items
       if (!isRowSync && payload.deleteMissing) {
         const codaItemIds = new Set(framerMappingResult.items.map((item) => String(item.id)));
-        let managedItemIds = [];
-        if (typeof collectionHandle.getItemIds === "function") {
+        let managedItemIds = managedItemIdsAfterAdd ?? [];
+        if (managedItemIdsAfterAdd === null && typeof collectionHandle.getItemIds === "function") {
           managedItemIds = await fetchItemIds("getManagedCollectionItemIds (deleteMissing)");
         }
         const toRemove = managedItemIds.filter((id) => !codaItemIds.has(id));
