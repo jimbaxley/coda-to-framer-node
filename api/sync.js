@@ -1463,32 +1463,51 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     return;
   }
 
-  try {
-    const resolvedTableRef = await resolveTableCached(
-      statusDocId,
-      statusTableIdOrName,
-      codaApiToken,
-    );
+  // Parse pre-resolved callback column IDs (format: "grid-xxx|Col:c-yyy,Col:c-zzz")
+  // to skip table and column resolution entirely on the callback path.
+  const cbColumnIdMap = new Map();
+  let cbPreresolvedTableId = "";
+  if (payload.callbackColumnIds) {
+    const raw = String(payload.callbackColumnIds);
+    const pipeIdx = raw.indexOf("|");
+    const colPart = pipeIdx > 0 ? raw.slice(pipeIdx + 1) : raw;
+    if (pipeIdx > 0) cbPreresolvedTableId = raw.slice(0, pipeIdx).trim();
+    for (const entry of colPart.split(",")) {
+      const colon = entry.indexOf(":");
+      if (colon > 0) {
+        const name = entry.slice(0, colon).trim();
+        const id = entry.slice(colon + 1).trim();
+        if (name && id) cbColumnIdMap.set(name.toLowerCase(), id);
+      }
+    }
+  }
 
-    // Write status to the underlying base table. When the callback target is a
-    // filtered view, the source row may no longer pass the filter (e.g. a row
-    // just removed from a "ready to publish" view by deleteRow). Searching the
-    // view would miss it and autocreate a duplicate; the base table always
-    // contains it, and updates there are reflected in the view.
-    const resolvedStatusTableId = await resolveBaseTableCached(
-      statusDocId,
-      resolvedTableRef,
-      codaApiToken,
-    );
+  function resolveCbColumn(nameOrId) {
+    if (!nameOrId) return null;
+    if (/^c-[A-Za-z0-9_-]+$/.test(String(nameOrId))) return nameOrId;
+    return cbColumnIdMap.get(String(nameOrId).toLowerCase()) || null;
+  }
+
+  try {
+    // Use pre-resolved table ID if available, otherwise resolve via API.
+    const resolvedStatusTableId = cbPreresolvedTableId
+      || await (async () => {
+        const ref = await resolveTableCached(statusDocId, statusTableIdOrName, codaApiToken);
+        return resolveBaseTableCached(statusDocId, ref, codaApiToken);
+      })();
 
     // Resolve status column, source base table (for log-table detection), and
     // table columns all in parallel — none depend on each other.
     const [resolvedStatusColumnId, sourceBaseTableId, tableColumns] = await Promise.all([
-      resolveColumnCached(statusDocId, resolvedStatusTableId, statusColumnNameOrId, codaApiToken),
+      resolveCbColumn(statusColumnNameOrId)
+        ? Promise.resolve(resolveCbColumn(statusColumnNameOrId))
+        : resolveColumnCached(statusDocId, resolvedStatusTableId, statusColumnNameOrId, codaApiToken),
       payload.tableIdOrName
         ? resolveBaseTableCached(statusDocId, payload.tableIdOrName, codaApiToken).catch(() => "")
         : Promise.resolve(""),
-      getCodaTableColumns(statusDocId, resolvedStatusTableId, codaApiToken),
+      cbColumnIdMap.size > 0
+        ? Promise.resolve([...cbColumnIdMap.entries()].map(([name, id]) => ({ name, id })))
+        : getCodaTableColumns(statusDocId, resolvedStatusTableId, codaApiToken),
     ]);
 
     // Distinguish a dedicated sync-log table from a write-back to the source

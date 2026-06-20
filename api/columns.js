@@ -1,4 +1,4 @@
-import { getCodaTableColumns } from "../lib/coda-client.js";
+import { getCodaTableColumns, resolveBaseTableId } from "../lib/coda-client.js";
 import { sendJson } from "./sync.js";
 
 export default async function handler(req, res) {
@@ -32,15 +32,18 @@ export default async function handler(req, res) {
   }
 
   try {
-    const columns = await getCodaTableColumns(docId, tableIdOrName, codaApiToken);
-    // Return as a compact Name:id,Name:id string for easy storage in a Coda cell,
-    // plus the raw array for any future use.
+    const [tableId, columns] = await Promise.all([
+      resolveBaseTableId(docId, tableIdOrName, codaApiToken),
+      getCodaTableColumns(docId, tableIdOrName, codaApiToken),
+    ]);
+
     const columnIdString = columns
       .map((col) => `${col.name}:${col.id}`)
       .join(",");
 
     return sendJson(res, 200, {
       success: true,
+      tableId,
       columnIdString,
       columns: columns.map((col) => ({ name: col.name, id: col.id })),
     });
