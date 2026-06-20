@@ -5,12 +5,9 @@ import {
   getCodaRowData,
   getCodaRowByColumnValue,
   getCodaTableColumns,
-  resolveColumnNameOrId,
-  resolveTableNameOrId,
   updateTableCell,
   updateTableRowCells,
   createTableRow,
-  resolveBaseTableId,
   getCodaTableDataPaginated,
 } from "../lib/coda-client.js";
 import {
@@ -30,6 +27,11 @@ import {
   shouldPublishItemToFramer,
   upsertEventsToConvex,
 } from "../lib/convex-client.js";
+import {
+  resolveTableCached,
+  resolveBaseTableCached,
+  resolveColumnCached,
+} from "../lib/coda-id-cache.js";
 
 function normalizeCollectionFieldsLocal(fields) {
   return (Array.isArray(fields) ? fields : [])
@@ -444,7 +446,7 @@ async function provisionCallbackRowIfNeeded(payload, { requestId, jobId, vercelT
   }
 
   try {
-    const resolvedTableRef = await resolveTableNameOrId(
+    const resolvedTableRef = await resolveTableCached(
       statusDocId,
       statusTableIdOrName,
       codaApiToken,
@@ -455,13 +457,13 @@ async function provisionCallbackRowIfNeeded(payload, { requestId, jobId, vercelT
     // just removed from a "ready to publish" view by deleteRow). Searching the
     // view would miss it and autocreate a duplicate; the base table always
     // contains it, and updates there are reflected in the view.
-    const resolvedStatusTableId = await resolveBaseTableId(
+    const resolvedStatusTableId = await resolveBaseTableCached(
       statusDocId,
       resolvedTableRef,
       codaApiToken,
     );
 
-    const resolvedStatusColumnId = await resolveColumnNameOrId(
+    const resolvedStatusColumnId = await resolveColumnCached(
       statusDocId,
       resolvedStatusTableId,
       statusColumnNameOrId,
@@ -518,7 +520,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
     // mirrors SyncRowToFramer's row-finding (getCodaTableData + findRowBySelector)
     // — which strips Coda's rich-text backtick wrappers and matches by slug or
     // API row id — but reads every page and targets the base table.
-    const deleteSearchTableId = await resolveBaseTableId(
+    const deleteSearchTableId = await resolveBaseTableCached(
       payload.docId,
       payload.tableIdOrName,
       codaApiToken,
@@ -527,7 +529,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
 
     let resolvedSlugFieldId = payload.slugFieldId;
     if (payload.slugFieldId) {
-      resolvedSlugFieldId = await resolveColumnNameOrId(
+      resolvedSlugFieldId = await resolveColumnCached(
         payload.docId,
         deleteSearchTableId,
         payload.slugFieldId,
@@ -709,10 +711,10 @@ async function executeSyncWorkflow(payload, eventLogger) {
   let resolvedFreshnessColumnId = freshnessColumnIdOrName;
   [resolvedSlugFieldId, resolvedFreshnessColumnId] = await Promise.all([
     payload.slugFieldId
-      ? resolveColumnNameOrId(payload.docId, payload.tableIdOrName, payload.slugFieldId, codaApiToken, codaReadOptions)
+      ? resolveColumnCached(payload.docId, payload.tableIdOrName, payload.slugFieldId, codaApiToken, codaReadOptions)
       : Promise.resolve(resolvedSlugFieldId),
     freshnessColumnIdOrName
-      ? resolveColumnNameOrId(payload.docId, payload.tableIdOrName, freshnessColumnIdOrName, codaApiToken, codaReadOptions)
+      ? resolveColumnCached(payload.docId, payload.tableIdOrName, freshnessColumnIdOrName, codaApiToken, codaReadOptions)
       : Promise.resolve(resolvedFreshnessColumnId),
   ]);
 
@@ -1441,7 +1443,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
   }
 
   try {
-    const resolvedTableRef = await resolveTableNameOrId(
+    const resolvedTableRef = await resolveTableCached(
       statusDocId,
       statusTableIdOrName,
       codaApiToken,
@@ -1452,7 +1454,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // just removed from a "ready to publish" view by deleteRow). Searching the
     // view would miss it and autocreate a duplicate; the base table always
     // contains it, and updates there are reflected in the view.
-    const resolvedStatusTableId = await resolveBaseTableId(
+    const resolvedStatusTableId = await resolveBaseTableCached(
       statusDocId,
       resolvedTableRef,
       codaApiToken,
@@ -1461,9 +1463,9 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     // Resolve status column, source base table (for log-table detection), and
     // table columns all in parallel — none depend on each other.
     const [resolvedStatusColumnId, sourceBaseTableId, tableColumns] = await Promise.all([
-      resolveColumnNameOrId(statusDocId, resolvedStatusTableId, statusColumnNameOrId, codaApiToken),
+      resolveColumnCached(statusDocId, resolvedStatusTableId, statusColumnNameOrId, codaApiToken),
       payload.tableIdOrName
-        ? resolveBaseTableId(statusDocId, payload.tableIdOrName, codaApiToken).catch(() => "")
+        ? resolveBaseTableCached(statusDocId, payload.tableIdOrName, codaApiToken).catch(() => "")
         : Promise.resolve(""),
       getCodaTableColumns(statusDocId, resolvedStatusTableId, codaApiToken),
     ]);
@@ -1489,7 +1491,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
     let resolvedMessageColumnId = "";
     if (messageColumnInput) {
       try {
-        resolvedMessageColumnId = await resolveColumnNameOrId(
+        resolvedMessageColumnId = await resolveColumnCached(
           statusDocId,
           resolvedStatusTableId,
           messageColumnInput,
@@ -1518,9 +1520,9 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
         const needsSlugResolve = !isApiRowId(sourceRowSelector) && (payload.slugFieldId || "");
 
         const [sourceStatusColumnId, resolvedSourceSlugFieldId] = await Promise.all([
-          resolveColumnNameOrId(statusDocId, sourceBaseTableId, sourceStatusColumnInput, codaApiToken),
+          resolveColumnCached(statusDocId, sourceBaseTableId, sourceStatusColumnInput, codaApiToken),
           needsSlugResolve
-            ? resolveColumnNameOrId(statusDocId, sourceBaseTableId, needsSlugResolve, codaApiToken)
+            ? resolveColumnCached(statusDocId, sourceBaseTableId, needsSlugResolve, codaApiToken)
             : Promise.resolve(""),
         ]);
 
@@ -1610,7 +1612,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       } else {
         let callbackSlugFieldId = callback.statusSlugField || callback.statusSlugFieldId || payload.slugFieldId || "";
         if (callbackSlugFieldId) {
-          callbackSlugFieldId = await resolveColumnNameOrId(
+          callbackSlugFieldId = await resolveColumnCached(
             statusDocId,
             resolvedStatusTableId,
             callbackSlugFieldId,
