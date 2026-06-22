@@ -1146,7 +1146,9 @@ async function executeSyncWorkflow(payload, eventLogger) {
   let publishResult = null;
   let publishError = "";
   const publishRequested = Boolean(payload.publish);
-  const cachedCollection = await readCallbackCollectionId(payload, codaApiToken, eventLogger);
+  const cachedCollection = isRowSync
+    ? { collectionId: "", assumeNew: false }
+    : await readCallbackCollectionId(payload, codaApiToken, eventLogger);
 
   await runSyncSession(
     payload.framerProjectUrl,
@@ -1917,7 +1919,7 @@ async function writeStatusCallback(payload, message, eventLogger, jobSnapshot = 
       || payload.collectionId
       || "",
     ).trim();
-    if (collectionIdColumnId && resolvedCollectionId) {
+    if (collectionIdColumnId && resolvedCollectionId && payload.action !== "rowSync") {
       await updateTableCell(
         statusDocId,
         resolvedStatusTableId,
