@@ -944,6 +944,7 @@ async function executeSyncWorkflow(payload, eventLogger) {
   const maxSnapshotAttempts = Math.max(maxCodaStateRetries, hasFreshnessAnchor ? freshnessMaxAttempts : 1);
   let lastFreshnessActual = "";
   let lastFreshnessPresence = "";
+  let lastRowFreshnessSignature = "";
   let lastTableFreshnessSignature = "";
   for (let attempt = 1; attempt <= maxSnapshotAttempts; attempt += 1) {
     const snapshotStartedAt = Date.now();
@@ -957,44 +958,59 @@ async function executeSyncWorkflow(payload, eventLogger) {
     });
 
     if (hasRowFreshnessAnchor) {
+      // Settle-based freshness: rather than require the Coda API to return the
+      // exact value that triggered the sync (which fails when the row has since
+      // advanced, e.g. Status moved past "Ready to Approve"), we wait until the
+      // watched value(s) stop changing across consecutive reads, then proceed
+      // with whatever Coda currently returns. This still guards against the
+      // Coda API's eventual-consistency staleness right after an edit.
       const freshnessResult = freshnessColumnIdOrName
         ? getFreshnessValue(tableData, resolvedFreshnessColumnId, freshnessColumnIdOrName)
         : { columnName: "", actual: "" };
       lastFreshnessActual = freshnessResult.actual;
-      const statusFreshnessMatches = freshnessColumnIdOrName
-        ? lastFreshnessActual === freshnessExpectedValue
-        : true;
       const expectedFreshnessResults = getExpectedFreshnessResults(tableData, rowExpectedFreshnessEntries);
-      const expectedFreshnessMatches = expectedFreshnessResults.every((result) => result.matches);
-      const freshnessMatches = statusFreshnessMatches && expectedFreshnessMatches;
+      const watchedValues = [
+        ...(freshnessColumnIdOrName ? [lastFreshnessActual] : []),
+        ...rowExpectedFreshnessEntries.map(
+          (entry) => getFreshnessValue(tableData, "", entry.columnIdOrName).actual,
+        ),
+      ];
+      const freshnessSignature = watchedValues.join("");
+      const previousSignature = lastRowFreshnessSignature;
+      lastRowFreshnessSignature = freshnessSignature;
+      const settled = attempt > 1 && freshnessSignature === previousSignature;
+
       eventLogger(
-        freshnessMatches ? "info" : "warning",
+        "info",
         "freshness",
-        freshnessMatches ? "Coda API freshness anchor matched" : "Coda API freshness anchor has not settled",
+        settled ? "Coda API freshness anchor settled" : "Coda API freshness anchor still settling",
         {
           attempt,
           maxAttempts: freshnessMaxAttempts,
           column: freshnessResult.columnName,
-          expected: freshnessExpectedValue,
           actual: lastFreshnessActual,
+          changed: attempt > 1 && freshnessSignature !== previousSignature,
           expectedValues: expectedFreshnessResults,
         },
       );
 
-      if (!freshnessMatches) {
+      if (!settled) {
         if (attempt >= freshnessMaxAttempts) {
-          const mismatch = expectedFreshnessResults.find((result) => !result.matches);
-          if (mismatch) {
-            throw new Error(
-              `Coda API freshness check failed for "${mismatch.column}": expected latest edited value, but Coda returned a different value.`,
-            );
-          }
-          throw new Error(
-            `Coda API freshness check failed for "${freshnessColumnIdOrName}": expected "${freshnessExpectedValue}", got "${lastFreshnessActual}".`,
+          eventLogger(
+            "warning",
+            "freshness",
+            "Coda API freshness value did not stabilize; proceeding with latest snapshot",
+            {
+              attempt,
+              maxAttempts: freshnessMaxAttempts,
+              column: freshnessResult.columnName,
+              actual: lastFreshnessActual,
+            },
           );
+        } else {
+          await sleep(freshnessDelayMs);
+          continue;
         }
-        await sleep(freshnessDelayMs);
-        continue;
       }
     }
 
