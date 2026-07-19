@@ -160,14 +160,14 @@ function scheduleJobProcessing({ req, res, jobId, requestId }) {
 }
 
 function getReconciliationDelayMs(payload = {}) {
-  // A row sync usually originates in a Coda automation immediately after a
-  // UI edit. Coda's API can still return the previous snapshot at that point,
-  // so run one follow-up read/write after its normal propagation window.
+  // Coda automations can arrive before the Coda API exposes the UI edit, so
+  // run one follow-up read/write after its normal propagation window.
   if (payload.isReconciliation || payload.reconciliation === false) {
     return 0;
   }
 
-  if (String(payload.action || "sync") !== "rowSync") {
+  const action = String(payload.action || "sync");
+  if (action !== "sync" && action !== "rowSync") {
     return 0;
   }
 

@@ -64,7 +64,7 @@ Optional retry/fallback tuning:
 - `FRAMER_ADD_CHUNK_TIMEOUT_MS` - timeout for each chunk fallback add call (default: min(operation timeout, `12000`))
 - `FRAMER_ADD_PER_ITEM_TIMEOUT_MS` - timeout for final per-item fallback adds (default: min(operation timeout, `8000`))
 - `CODA_INITIAL_DELAY_MS` - initial delay before extraction to allow recent Coda UI edits to become API-visible (default: `1200`, max `120000`)
-- `CODA_RECONCILIATION_DELAY_MS` - one delayed re-sync for `rowSync` requests, measured from initial request acceptance (default: `120000`; set to `0` to disable, max `600000`)
+- `CODA_RECONCILIATION_DELAY_MS` - one delayed re-sync for `sync` and `rowSync` requests, measured from initial request acceptance (default: `120000`; set to `0` to disable, max `600000`)
 
 ## Securing the API Endpoint
 
@@ -151,7 +151,7 @@ Status endpoint:
 - For table sync, set `deleteMissing: true` to remove managed collection items that are no longer present in the Coda table snapshot.
 - When Coda returns transient empty slug values during recent UI edits, the handler retries Coda snapshot/mapping before returning warnings.
 - `initialDelayMs` (or env default `CODA_INITIAL_DELAY_MS`) is applied before extract to mitigate Coda UI/API propagation lag.
-- `rowSync` requests schedule one reconciliation sync by default, two minutes after the initial request is accepted. It repeats the Coda read and Framer write, reports its result through the normal Coda callback/status cell, then stops. Send `"reconciliation": false` or `"reconciliationDelayMs": 0` to disable it for an individual request.
+- `sync` and `rowSync` requests schedule one reconciliation sync by default, two minutes after the initial request is accepted. It repeats the Coda read and Framer write, reports its result through the normal Coda callback/status cell, then stops. Send `"reconciliation": false` or `"reconciliationDelayMs": 0` to disable it for an individual request.
 - Source Coda row/table extraction uses normal snapshot reads by default so Coda snapshot lag does not block syncs. Set `CODA_REQUIRE_LATEST_SOURCE_READS=true` or send `requireLatestCodaSnapshot: true` only when you explicitly want `X-Coda-Doc-Version: latest` to hard-gate source reads.
 - Callback/status-log bookkeeping does not use `X-Coda-Doc-Version: latest`.
 - Coda API callback writes poll the Coda mutation-status endpoint when the write response includes a mutation request id.
