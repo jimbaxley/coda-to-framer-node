@@ -159,6 +159,72 @@ function scheduleJobProcessing({ req, res, jobId, requestId }) {
   }, 0);
 }
 
+function getReconciliationDelayMs(payload = {}) {
+  // A row sync usually originates in a Coda automation immediately after a
+  // UI edit. Coda's API can still return the previous snapshot at that point,
+  // so run one follow-up read/write after its normal propagation window.
+  if (payload.isReconciliation || payload.reconciliation === false) {
+    return 0;
+  }
+
+  if (String(payload.action || "sync") !== "rowSync") {
+    return 0;
+  }
+
+  return parseIntEnv(
+    payload.reconciliationDelayMs ?? process.env.CODA_RECONCILIATION_DELAY_MS ?? 120000,
+    120000,
+    0,
+    600000,
+  );
+}
+
+function scheduleReconciliation(job, eventLogger, context = {}) {
+  const delayMs = getReconciliationDelayMs(job.payload);
+  if (delayMs <= 0) return;
+
+  const jobId = randomUUID();
+  const targetTime = new Date(job.createdAt).getTime() + delayMs;
+  const waitMs = Math.max(0, targetTime - Date.now());
+  const payload = {
+    ...job.payload,
+    // A reconciliation is deliberately a one-shot repeat. It must not spawn
+    // another reconciliation when it completes.
+    isReconciliation: true,
+    reconciliationParentJobId: job.jobId,
+    reconciliationDelayMs: 0,
+    initialDelayMs: 0,
+  };
+
+  createJob({
+    jobId,
+    requestId: job.requestId,
+    idempotencyKey: "",
+    payload,
+  });
+
+  eventLogger("info", "reconciliation_scheduled", "Scheduled delayed Coda reconciliation sync", {
+    reconciliationJobId: jobId,
+    delayMs,
+    waitMs,
+  });
+
+  const run = async () => {
+    if (waitMs > 0) await sleep(waitMs);
+    await processJob(jobId, context);
+  };
+
+  const waitUntil = getWaitUntil(context.req, context.res);
+  if (waitUntil) {
+    waitUntil(run());
+    return;
+  }
+
+  setTimeout(() => {
+    run();
+  }, waitMs);
+}
+
 function parseJobIdFromRequest(req) {
   const requestUrl = new URL(req.url || "", "http://localhost");
   return requestUrl.searchParams.get("jobId") || "";
@@ -2074,7 +2140,13 @@ async function processJob(jobId, context = {}) {
       publishError: result.publishError || "",
     });
     const completedJob = getJobWithEvents(jobId) || getJob(jobId);
-    await writeStatusCallback(job.payload, result.message, eventLogger, completedJob, context);
+    if (!job.payload.skipStatusCallback) {
+      const callbackMessage = job.payload.isReconciliation
+        ? `🔄 Reconciliation: ${result.message}`
+        : result.message;
+      await writeStatusCallback(job.payload, callbackMessage, eventLogger, completedJob, context);
+    }
+    scheduleReconciliation(getJob(jobId) || job, eventLogger, context);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const failure = makeFailureResponse(errorMessage);
@@ -2088,7 +2160,13 @@ async function processJob(jobId, context = {}) {
       error: errorMessage,
     });
     const failedJob = getJobWithEvents(jobId) || getJob(jobId);
-    await writeStatusCallback(job.payload, failure.message, eventLogger, failedJob, context);
+    if (!job.payload.skipStatusCallback) {
+      const callbackMessage = job.payload.isReconciliation
+        ? `🔄 Reconciliation: ${failure.message}`
+        : failure.message;
+      await writeStatusCallback(job.payload, callbackMessage, eventLogger, failedJob, context);
+    }
+    scheduleReconciliation(getJob(jobId) || job, eventLogger, context);
   }
 }
 

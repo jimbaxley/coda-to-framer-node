@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-19
+
+### Added
+- `rowSync` requests now schedule one delayed reconciliation sync two minutes after acceptance by default. This re-reads Coda after UI/API propagation lag, repeats the Framer write, and updates the normal callback/status cell without creating further reconciliation jobs.
+- Added `CODA_RECONCILIATION_DELAY_MS`, `reconciliationDelayMs`, and `reconciliation` controls for the delayed reconciliation pass.
+
 ## 2026-02-18
 
 ### Added
