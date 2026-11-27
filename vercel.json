@@ -2,6 +2,9 @@
   "functions": {
     "api/sync.js": {
       "maxDuration": 300
+    },
+    "api/convex-push.js": {
+      "maxDuration": 120
     }
   }
 }
